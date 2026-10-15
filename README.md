@@ -18,7 +18,6 @@ Queue work from your local agent and run Codex on remote project workspaces. Jir
 - [Local intake through Atlassian MCP](#local-intake-through-atlassian-mcp)
 - [Remote workspace](#remote-workspace)
 - [Recovery and inspection](#recovery-and-inspection)
-- [Read-only watcher](#read-only-watcher)
 - [Verify](#verify)
 
 ## Remote setup
@@ -29,17 +28,21 @@ The remote machine needs:
 
 - **Python 3.10 or later** on macOS or Linux.
 - **Git**, **GitHub CLI**, and **Codex CLI**.
-- A Codex profile using the file format supported by **Codex CLI 0.162.1**.
+- **Codex CLI 0.162.1 or later** with support for permission profiles. A separate worker profile is optional.
 
 ### Install and configure credentials
 
+Install the worker package with pipx:
+
 ```sh
-bash setup.sh
-source .venv/bin/activate
-cp .env.example .env
+pipx install "git+https://github.com/YOUR_ACCOUNT/agentic-louis.git"
 ```
 
-Set the following values in `.env` or your environment:
+Replace the GitHub URL with your repository URL. The package exposes the `agentic-louis` command.
+The local intake skill is a separate installation and is not included in this package.
+For local development, run `bash setup.sh` and activate `.venv` instead.
+
+Set the following values in your exported environment or a `.env` file in the directory where you run `agentic-louis`:
 
 | Variable | Value |
 | --- | --- |
@@ -48,7 +51,8 @@ Set the following values in `.env` or your environment:
 | `SLACK_WORKFLOW_URL` | Your Slack Workflow Builder webhook URL. It must start with `https://hooks.slack.com/triggers/`. |
 | `JIRA_API_BASE_URL` | Your Atlassian API gateway URL for a scoped Jira token. Leave empty for a site token. |
 
-Scripts load `.env` from this repository. Environment values take precedence over `.env`.
+The worker loads only `.env` in the current working directory. Exported environment variables take precedence.
+It also works with exported variables alone, without a `.env` file.
 
 ### Jira requirements
 
@@ -56,7 +60,8 @@ The default board is [LTRA](https://datadoghq.atlassian.net/jira/software/projec
 
 - The board must have **To Do**, **In Progress**, and **In Review** columns with distinct status mappings.
 - The LTRA project must have a **Task** issue type.
-- The remote token needs board and issue read access, issue transitions, and comments.
+- The remote token needs board and issue read access, issue transitions, comments, and issue property read/write access.
+- The workflow must offer a transition to **Blocked** for failed work. A separate Blocked board column is optional.
 - Your Jira account needs the corresponding project permissions.
 
 ## Local intake through Atlassian MCP
@@ -102,7 +107,8 @@ The skill selects from this registry. The worker accepts exactly one project lab
 
 Atlassian MCP allows arbitrary Jira labels. The skill instructions constrain label selection, and the worker validates labels before execution; Atlassian MCP itself does not enforce this restriction.
 
-**When adding a project, update both the installed skill copies and the remote checkout registry.**
+**When adding a project, update the separate skill registry and the worker registry in `agentic_louis/projects.json`.**
+Install the updated skill and worker package on the machines that use them.
 
 ### Duplicate protection
 
@@ -112,56 +118,54 @@ It never resets a queued ticket to To Do.
 
 ## Remote workspace
 
-### Configure one workspace per project
+### Run from the repository folder
 
-Run **one workspace and one worker daemon per project**, with one persistent state directory for that workspace.
+Run one worker per project. No workspace file is required.
 
-Two daemons with different state directories must never manage the same project. The process lock prevents concurrent workers from sharing a state directory.
+If the current directory is a Git repository root, the worker uses that repository.
+Otherwise it discovers Git repository roots in immediate child directories.
+It ignores hidden directories, symlink directories, and repositories nested more deeply.
+All discovered repositories belong to the selected project workspace.
 
-Copy `examples/workspace.json` to `workspace.local.json`, then configure each repository:
+For each repository, the worker reads the GitHub repository from `origin` and resolves its default branch from the remote HEAD.
+It fails with an error if either value cannot be resolved.
+Codex chooses validation from each repository's `AGENTS.md` and build or test configuration.
 
-- Set its unique name, path, GitHub repository, and base branch.
-- Ensure its origin points to the configured GitHub repository.
-- Set validation commands as direct argument arrays, such as `["yarn", "test"]`.
-- Use `[]` explicitly if it has no automated checks.
+Configure Git identity and authentication in the remote account, then run `gh auth login` and `codex login` once.
+The GitHub account needs write access to each repository.
 
-Paths can be absolute or relative to the configuration file. Add more repository entries if the project spans several repositories; every entry needs a unique name, path, and GitHub repository.
+```sh
+cd /path/to/folder-containing-your-repositories
+agentic-louis --project trajectory --dry-run
+agentic-louis --project trajectory
+```
 
-### Authenticate and configure Codex
+The dry run prints the discovered repositories, base branches, state directory, and managed Jira tickets.
+It does not change Jira or launch agents.
+The regular command runs in the foreground and can be used in tmux or a process supervisor.
 
-1. Configure Git identity and authentication in the remote account.
-2. Run `gh auth login` and `codex login`. The GitHub account needs write access to each repository.
-3. Copy `examples/agentic-worker.config.toml` to `~/.codex/agentic-worker.config.toml`. If you set `CODEX_HOME`, put the file there instead.
-4. Set the model in that profile if needed. Keep legacy `sandbox_mode` and `sandbox_workspace_write` settings out of it.
+The worker stores logs, process metadata, and Git worktrees under `~/.local/state/agentic-louis/trajectory`.
+If `XDG_STATE_HOME` is set, it uses `$XDG_STATE_HOME/agentic-louis/trajectory` instead.
+Each project has a separate state directory and process lock.
+Jira is the task tracker. Execution checkpoints live in Jira issue properties, including attempts and notification delivery.
+The worker does not create a local task database. Existing database checkpoints are copied to Jira without overwriting newer Jira metadata.
+Keep that directory across restarts and package upgrades.
 
-The worker skips the base Codex configuration and loads the selected profile file. For each session, it sets task write access, network access, and unattended execution, and grants Git metadata writes for the configured repositories so Codex can commit changes.
+The worker admits tasks oldest first, with five slots shared by running tasks and tasks awaiting review.
+It polls every five seconds and uses a two-hour run timeout.
+Each task gets native Git worktrees and a `dubloom/<ticket-key>` branch across the discovered repositories.
+Retries reuse existing branches, including branches created with the previous prefix.
 
+### Optional overrides
+
+Use `--state-dir /path/to/state` to override the default state directory.
+Use `--profile NAME` to load `$CODEX_HOME/NAME.config.toml` if you want a specific model or additional Codex settings.
+Without `--profile`, no worker profile file is needed.
+The worker skips the base Codex configuration and applies task permissions itself.
+It grants Git metadata writes for discovered repositories so Codex can commit changes.
 Jira credentials and the Slack webhook URL are removed from child process environments.
 
-### Check setup and start the worker
-
-Check prerequisites and list managed tickets without Jira writes or agent launches:
-
-```sh
-python3 -m agentic_louis.worker --project trajectory --config workspace.local.json --dry-run
-```
-
-Start the foreground worker in tmux or your existing process supervisor:
-
-```sh
-python3 -m agentic_louis.worker --project trajectory --config workspace.local.json
-```
-
-| Setting | Default | Configuration key |
-| --- | --- | --- |
-| Poll interval | 5 seconds | `interval` |
-| Run timeout | 2 hours | `timeout` |
-
-Set these keys in the workspace configuration to change the defaults.
-
-The worker admits tasks oldest first. It reserves a slot, confirms In Progress in Jira, and launches Codex. Each task has separate worktrees and a branch across the configured repositories.
-
-Up to five tasks can run concurrently if no tasks await review.
+Keep legacy `sandbox_mode` and `sandbox_workspace_write` settings out of an optional Codex profile.
 
 ### Validation and handoff
 
@@ -171,7 +175,7 @@ Before handing off, the worker:
 
 - Verifies draft status, branch ownership, pushed commits, and coverage of changed repositories.
 - Runs configured checks and rejects uncommitted changes.
-- Restores draft status and pauses the ticket if Codex publishes a non-draft PR.
+- Restores draft status and blocks the ticket if Codex publishes a non-draft PR.
 
 After verification, it adds a Jira comment, moves the ticket to **In Review**, and sends the Slack webhook. The workflow receives:
 
@@ -180,9 +184,12 @@ After verification, it adds a Jira comment, moves the ticket to **In Review**, a
 | `jira_ticket_name` | Jira ticket name. |
 | `project_label` | Project label. |
 | `jira_ticket_url` | Jira ticket URL. |
-| `prs` | Newline-separated PRs. |
+| `blocked` | Boolean: `false` for review, `true` for failed work. |
+| `prs` | Newline-separated PRs for review notifications. Omitted for blocked notifications. |
 
-It sends one notification per ticket, even when the task produces several PRs.
+It sends one review notification per completed attempt, even when the task produces several PRs.
+If work fails, the worker records the error in Jira, moves the ticket to **Blocked**, and sends `blocked: true` without PRs.
+The slot becomes available after Jira confirms Blocked.
 
 **Review comments, merging, ready status, and Jira completion remain manual.** Move a finished ticket out of In Review to release its slot.
 
@@ -193,32 +200,33 @@ It sends one notification per ticket, even when the task produces several PRs.
 Run this while the worker is running:
 
 ```sh
-python3 -m agentic_louis.worker --project trajectory --config workspace.local.json status
+agentic-louis --project trajectory status
 ```
 
-Runs, worktrees, events, results, and validation logs live under the configured state directory. **Keep this directory across restarts.**
+Git worktrees, process metadata, events, results, and validation logs live under the project artifact directory. Task tracking stays in Jira. **Keep this directory across restarts.**
 
 ### Restart the worker
 
 Stopping the worker leaves existing supervisors running. Independent supervisors save Codex exit results even if the worker stops.
 
-Restart with the same configuration and state directory to collect their results. The worker saves completion stages so retries of Jira operations do not rerun implementation.
+Restart from the same repository folder to collect their results. Use the same overrides if you supplied any. The worker saves completion stages so retries of Jira operations do not rerun implementation.
 
 ### Retry a failed task
 
-Failed work stays **In Progress** and keeps its slot. The worker records the error in Jira and waits for intervention.
+Failed work moves to **Blocked** and releases its slot. The worker records the error in Jira, sends a blocked notification, and waits for intervention.
 
 1. Inspect the logs and resolve the error.
 2. Stop the worker.
 3. Retry the failed ticket:
 
 ```sh
-python3 -m agentic_louis.worker --project trajectory --config workspace.local.json retry LTRA-123
+agentic-louis --project trajectory retry LTRA-123
 ```
 
 The retry command starts the saved task, then continues the worker loop. It reuses worktrees, branches, and existing PRs.
 
-A retry requires a failed run whose ticket is In Progress. If admission failed before the transition, resolve the error and move that ticket to In Progress before retrying.
+A retry requires a failed run whose ticket is Blocked and a free project slot.
+The worker moves it to In Progress before starting the next attempt.
 
 This command does not handle review follow-up.
 
@@ -231,29 +239,15 @@ If Slack delivery is uncertain, the worker records that state and does not resen
 3. Resend explicitly:
 
 ```sh
-python3 -m agentic_louis.worker --project trajectory --config workspace.local.json resend LTRA-123
+agentic-louis --project trajectory resend LTRA-123
 ```
 
 ### Capacity after a restart
 
-On restart, the worker counts managed active tickets from Jira and saved reservations. It pauses unknown In Progress tickets rather than starting duplicate work.
+On restart, the worker reads Jira statuses and execution checkpoints to recover active attempts and notification delivery.
+It moves unknown In Progress work to Blocked rather than starting duplicate work.
 
 Change managed ticket statuses through this worker when starting new work. Manual status changes can exceed the limit before the worker sees them. The worker admits no further tickets while capacity is full.
-
-## Read-only watcher
-
-The original command remains available:
-
-```sh
-python3 watch_jira.py --label proj-trajectory
-python3 watch_jira.py --label proj-trajectory --once
-```
-
-- Prints JSON events to stdout and logs to stderr.
-- Reads Jira without claiming tickets or launching agents.
-- Deduplicates events until the watcher stops.
-
-Use `--interval`, `--board-url`, and `--column` to change its settings.
 
 ## Verify
 
@@ -263,4 +257,5 @@ python3 -m unittest discover -s tests -v
 
 Tests use mocked services and temporary Git repositories. They do not create live Jira tickets, GitHub PRs, or Slack messages.
 
+Installation uses [pipx](https://pipx.pypa.io/latest/how-to/install-pipx.html).
 The worker uses [Codex non-interactive mode](https://learn.chatgpt.com/docs/non-interactive-mode) and [GitHub CLI](https://cli.github.com/manual/gh_pr_view).

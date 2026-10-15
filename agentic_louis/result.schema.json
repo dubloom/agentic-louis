@@ -1,0 +1,22 @@
+{
+  "type": "object",
+  "properties": {
+    "outcome": {"type": "string", "enum": ["success", "failed"]},
+    "summary": {"type": "string"},
+    "validation": {"type": "string"},
+    "prs": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "repository": {"type": "string"},
+          "url": {"type": "string"}
+        },
+        "required": ["repository", "url"],
+        "additionalProperties": false
+      }
+    }
+  },
+  "required": ["outcome", "summary", "validation", "prs"],
+  "additionalProperties": false
+}

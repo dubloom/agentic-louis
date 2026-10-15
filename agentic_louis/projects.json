@@ -1,0 +1,8 @@
+{
+  "jira_project": "LTRA",
+  "managed_label": "agentic-managed",
+  "projects": {
+    "trajectory": "proj-trajectory",
+    "dd-trace-py": "dd-trace-py"
+  }
+}

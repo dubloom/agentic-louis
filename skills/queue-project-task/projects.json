@@ -1,0 +1,10 @@
+{
+  "cloud_id": "66c05bee-f5ff-4718-b6fc-81351e5ef659",
+  "site_url": "https://datadoghq.atlassian.net",
+  "jira_project": "LTRA",
+  "managed_label": "agentic-managed",
+  "projects": {
+    "trajectory": "proj-trajectory",
+    "dd-trace-py": "dd-trace-py"
+  }
+}

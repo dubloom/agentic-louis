@@ -1,0 +1,10 @@
+interface:
+  display_name: "Queue project task"
+  short_description: "Queue remote work through Jira for an allowed project"
+  default_prompt: "Use $queue-project-task to queue this feature request through Atlassian MCP."
+
+dependencies:
+  tools:
+    - type: "mcp"
+      value: "atlassian"
+      description: "Connected Atlassian MCP tools for Jira creation, edits, search, and transitions"

@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agentic-louis"
+version = "0.1.0"
+description = "Run project agents from a Jira queue"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["python-dotenv>=1.0", "tomli>=2; python_version < '3.11'"]
+
+[project.scripts]
+agentic-louis = "agentic_louis.worker:main"
+
+[tool.setuptools]
+packages = ["agentic_louis"]
+
+[tool.setuptools.package-data]
+agentic_louis = ["result.schema.json", "projects.json"]
