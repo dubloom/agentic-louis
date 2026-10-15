@@ -76,6 +76,11 @@ class Worker:
     def managed(self, issue):
         return is_managed(issue, self.config.project)
 
+    def eligible(self, issue):
+        status = issue["fields"]["status"]
+        return (not Jira.is_blocked(issue)
+                and (status["id"] in self.columns["To Do"] or status.get("name", "").strip().casefold() == "ready"))
+
     def fail(self, run, error):
         try:
             self.stop(run)
@@ -95,7 +100,7 @@ class Worker:
                                "Agent work failed. Moving the ticket to Blocked.\n"
                                + run.get("error", "Unknown error")
                                + "\n" + "\n".join(run.get("partial_prs", []))
-                               + "\nInspect the worker status and run logs, then use the retry command.")
+                               + "\nInspect the worker status and run logs, then move this ticket to Ready to retry.")
         run["blocked_commented"] = run.get("attempt", 0)
         self.state.save(run)
 
@@ -148,10 +153,13 @@ class Worker:
     def tick(self, *, admit=True):
         if self.columns is None:
             self.columns = self.jira.columns()
+        # Jira statuses determine eligibility, regardless of saved execution stages.
+        queued = [i for i in self.jira.candidates(project_label(self.config.project), None)
+                  if self.eligible(i)] if admit else []
         # Discover managed active work after state loss or workspace migration.
         for candidate in self.jira.candidates(project_label(self.config.project), self.active_statuses()):
             issue = self.jira.issue(candidate["key"])
-            if self.managed(issue) and not Jira.is_blocked(issue) and issue["fields"]["status"]["id"] in self.active_statuses():
+            if self.managed(issue) and not Jira.is_blocked(issue) and not self.eligible(issue) and issue["fields"]["status"]["id"] in self.active_statuses():
                 self.adopt(issue)
         active = set()
         for run in self.state.all():
@@ -166,21 +174,21 @@ class Worker:
                     run["phase"] = "blocked"
                     self.state.save(run)
                 continue
-            if status not in self.active_statuses():
-                if run["phase"] in BLOCKING and status in self.columns["To Do"]:
-                    self.block_failure(run)
-                    continue
-                # A claim may have been persisted just before a daemon crash.
-                if run["phase"] == "claiming" and status in self.columns["To Do"]:
-                    self.fail(run, "Ticket admission was interrupted. Explicit retry is required.")
-                    self.block_failure(run)
-                    continue
+            if self.eligible(issue) or status not in self.active_statuses():
                 self.stop(run)
                 if run["phase"] != "released":
                     run["phase"] = "released"
                     self.state.save(run)
                 continue
             active.add(run["key"])
+            if status in self.columns["In Review"]:
+                self.stop(run)
+                if run["phase"] in {"transitioning", "notifying"}:
+                    self.finish(run)
+                elif run["phase"] != "review":
+                    run.update(phase="review", notification="unavailable")
+                    self.state.save(run)
+                continue
             if run["phase"] in {"released", "blocked"}:
                 self.fail(run, "Ticket became active again. Explicit retry is required.")
             elif not self.managed(issue):
@@ -200,17 +208,21 @@ class Worker:
                 active.discard(run["key"])
         if not admit or len(active) >= LIMIT:
             return len(active)
-        for candidate in self.jira.candidates(project_label(self.config.project), self.columns["To Do"]):
+        for candidate in queued:
             if len(active) >= LIMIT:
                 break
             key = candidate["key"]
-            if self.state.get(key):
-                continue
             issue = self.jira.issue(key)
-            if not self.managed(issue) or Jira.is_blocked(issue) or issue["fields"]["status"]["id"] not in self.columns["To Do"]:
+            if not self.managed(issue) or not self.eligible(issue):
                 continue
-            run = {"key": key, "summary": issue["fields"]["summary"], "phase": "claiming",
-                   "attempt": 0, "notification": "pending"}
+            previous = self.state.get(key) or {}
+            self.stop(previous)
+            # Jira status queues work. Preserve only reusable execution details;
+            # results and notification stages belong to the previous attempt.
+            run = {field: previous[field] for field in ("branch", "repositories") if field in previous}
+            run.update(key=key, summary=issue["fields"]["summary"], phase="claiming",
+                       attempt=previous.get("attempt", 0), notification="pending")
+            LOG.info("%s: %s; starting attempt %s", key, issue["fields"]["status"]["name"], run["attempt"] + 1)
             self.state.save(run)
             active.add(key)
             try:
@@ -303,8 +315,12 @@ class Worker:
             "Work only in these worktrees. Keep all changes on the assigned branch.\n"
             "Run the configured checks for changed repositories and appropriate tests from repository instructions.\n"
             "If no checks are configured, choose appropriate validation from AGENTS.md and repository build and test configuration.\n"
-            "If validation fails or the task is incomplete, return outcome=failed and explain why.\n"
-            "Commit and push completed changes to origin. Use GitHub CLI to open exactly one draft PR per changed repository.\n"
+            "Complete all required tests and validation for every changed repository BEFORE opening any PR.\n"
+            "If tests or validation fail, cannot start, are skipped, or cannot complete (for example, Docker is unavailable), "
+            "stop and return outcome=failed with prs=[] and explain the blocking command and error.\n"
+            "In that case, do not create or reopen any PR, or update an existing PR. Do not treat unexecuted tests as passing.\n"
+            "Only after all required validation passes and the task is complete, commit and push completed changes to origin. "
+            "Then use GitHub CLI to open exactly one draft PR per changed repository.\n"
             "Include the Jira URL and validation results in each PR. All PRs MUST remain drafts. Never merge or mark ready.\n"
             "Check for an existing PR on this branch before creating one. Reuse it on a retry.\n"
             "Do not change Jira or send notifications. The worker handles those actions.\n"
@@ -469,7 +485,7 @@ class Worker:
                 self.state.save(run)
             if run["phase"] == "commenting":
                 result = run["result"]
-                self.jira.comment_once(run["key"], f"[agentic-louis:{run['key']}:ready]",
+                self.jira.comment_once(run["key"], f"[agentic-louis:{run['key']}:ready:{run.get('attempt', 0)}]",
                     result["summary"] + "\n\nValidation\n" + result["validation"]
                     + "\n" + "\n".join(run.get("verified_checks", []))
                     + "\n\nDraft PRs\n" + "\n".join(pr["url"] for pr in result["prs"]))
@@ -585,7 +601,7 @@ def main(argv=None):
         worker.preflight()
         if args.dry_run or args.action == "check":
             matching = []
-            for candidate in jira.candidates(project_label(config.project), sum(worker.columns.values(), [])):
+            for candidate in jira.candidates(project_label(config.project), None):
                 issue = jira.issue(candidate["key"])
                 if worker.managed(issue):
                     matching.append({"key": issue["key"], "status": issue["fields"]["status"]["name"]})

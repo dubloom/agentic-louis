@@ -1,6 +1,8 @@
 import json
 import os
 from pathlib import Path
+import re
+import shlex
 import signal
 import subprocess
 
@@ -9,18 +11,35 @@ class CommandError(ValueError):
     pass
 
 
+def redact(text, env):
+    for name, value in env.items():
+        if value and re.search(r"TOKEN|PASSWORD|SECRET|API_KEY|WEBHOOK|SLACK_WORKFLOW_URL", name, re.I):
+            text = text.replace(value, "[redacted]")
+    return re.sub(r"(https?://)[^\s/@]+@", r"\1[redacted]@", text)
+
+
 def child_environment():
     return {k: v for k, v in os.environ.items()
             if not k.startswith("JIRA_") and k != "SLACK_WORKFLOW_URL"}
 
 
 def command(args, *, cwd=None, timeout=60, env=None, log_path=None):
+    effective_env = env if env is not None else child_environment()
+    invocation = shlex.join([str(arg) for arg in args])
+    location = str(Path(cwd or Path.cwd()).resolve())
+
+    def failure(reason, output=""):
+        detail = f"Command {invocation} {reason}\nWorking directory: {location}"
+        if output.strip():
+            detail += "\n" + output.strip()
+        return CommandError(redact(detail, {**os.environ, **effective_env}))
+
     try:
-        process = subprocess.Popen([str(a) for a in args], cwd=cwd, env=env or child_environment(),
+        process = subprocess.Popen([str(a) for a in args], cwd=cwd, env=effective_env,
                                    text=True, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                    stderr=subprocess.PIPE, start_new_session=True)
-    except OSError:
-        raise CommandError(f"Cannot start command {args[0]}.") from None
+    except OSError as error:
+        raise failure(f"could not start: {error}") from None
     timed_out = False
     try:
         stdout, stderr = process.communicate(timeout=timeout)
@@ -31,10 +50,9 @@ def command(args, *, cwd=None, timeout=60, env=None, log_path=None):
     if log_path is not None:
         Path(log_path).write_text(stdout + "\n" + stderr)
     if timed_out:
-        raise CommandError(f"Command {args[0]} exceeded its {timeout}s timeout.")
+        raise failure(f"exceeded its {timeout}s timeout.", stderr or stdout)
     if process.returncode:
-        # Do not print stderr: a configured remote URL or tool error can include credentials.
-        raise CommandError(f"Command {args[0]} {args[1] if len(args) > 1 else ''} failed (exit {process.returncode}).")
+        raise failure(f"failed (exit {process.returncode}).", stderr or stdout)
     return stdout.strip()
 
 

@@ -62,6 +62,7 @@ The default board is [LTRA](https://datadoghq.atlassian.net/jira/software/projec
 - The LTRA project must have a **Task** issue type.
 - The remote token needs board and issue read access, issue transitions, comments, and issue property read/write access.
 - The workflow must offer a transition to **Blocked** for failed work. A separate Blocked board column is optional.
+- The **Ready** status queues retries after manual intervention. It must be visible on the board and offer a transition to In Progress; a separate Ready column is optional.
 - Your Jira account needs the corresponding project permissions.
 
 ## Local intake through Atlassian MCP
@@ -171,6 +172,8 @@ Keep legacy `sandbox_mode` and `sandbox_workspace_write` settings out of an opti
 
 Codex reads the task and repository instructions, implements the change, runs checks, and publishes draft PRs.
 
+Agent instructions require all necessary tests and validation to pass across changed repositories before opening any PR. Failed, skipped, or unexecuted checks (including tests that cannot start because Docker is unavailable) must produce a failed result without creating or reopening a PR or updating an existing PR. The worker moves failed work to Blocked.
+
 Before handing off, the worker:
 
 - Verifies draft status, branch ownership, pushed commits, and coverage of changed repositories.
@@ -213,7 +216,11 @@ Restart from the same repository folder to collect their results. Use the same o
 
 ### Retry a failed task
 
-Failed work moves to **Blocked** and releases its slot. The worker records the error in Jira, sends a blocked notification, and waits for intervention.
+Failed work moves to **Blocked** and releases its slot. The worker records the error in Jira and sends a blocked notification. Blocked tickets wait for manual intervention. Move a blocked ticket to **Ready** when it should be retried.
+
+Both **To Do** and **Ready** queue work. The running worker starts another attempt when a slot is free, reusing its branch, worktrees, and existing PRs. Saved execution checkpoints never prevent these tickets from being queued again. Moving a ticket to Blocked stops implementation; moving it to In Review stops implementation and holds its review slot.
+
+Alternatively, use the explicit retry command:
 
 1. Inspect the logs and resolve the error.
 2. Stop the worker.

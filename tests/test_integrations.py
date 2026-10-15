@@ -12,13 +12,33 @@ from urllib.error import HTTPError, URLError
 from agentic_louis.github import GitHub
 from agentic_louis import ROOT
 from agentic_louis.jira import ApiError, Jira
-from agentic_louis.process import atomic_json, command
+from agentic_louis.process import CommandError, atomic_json, command
 from agentic_louis.webhook import send
 from test_workflow import issue
 
 
 class Response(io.BytesIO):
     status = 200
+
+
+class CommandTests(unittest.TestCase):
+    def test_git_failure_includes_stderr_command_and_working_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaises(CommandError) as raised:
+                command(["git", "worktree", "list"], cwd=directory, env={"PATH": os.environ["PATH"]})
+            message = str(raised.exception)
+            self.assertIn("git worktree list failed (exit 128)", message)
+            self.assertIn("not a git repository", message)
+            self.assertIn(str(Path(directory).resolve()), message)
+
+    def test_failure_preserves_diagnostic_but_redacts_credentials(self):
+        script = "import os, sys; sys.stderr.write('fatal: denied ' + os.environ['TEST_API_TOKEN'] + ' https://user:pass@example.com/repo'); sys.exit(1)"
+        with self.assertRaises(CommandError) as raised:
+            command([sys.executable, "-c", script], env={"TEST_API_TOKEN": "test-private-token"})
+        message = str(raised.exception)
+        self.assertIn("fatal: denied [redacted] https://[redacted]@example.com/repo", message)
+        self.assertNotIn("test-private-token", message)
+        self.assertNotIn("user:pass", message)
 
 
 class TransportTests(unittest.TestCase):

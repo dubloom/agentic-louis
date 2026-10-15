@@ -16,7 +16,7 @@ from agentic_louis.jira import column_statuses, quote_jql, retry_delay
 
 
 COLUMNS = {"To Do": ["1"], "In Progress": ["2"], "In Review": ["3"]}
-STATUS_NAMES = {"1": "To Do", "2": "In Progress", "3": "In Review", "4": "Done", "5": "Blocked"}
+STATUS_NAMES = {"1": "To Do", "2": "In Progress", "3": "In Review", "4": "Done", "5": "Blocked", "6": "Ready"}
 
 
 def issue(key, status="1", project="trajectory", managed=True):
@@ -174,7 +174,6 @@ class WorkerTests(unittest.TestCase):
         self.add(5, "2")
         self.add(1, start=6)
         self.worker.tick()
-        self.worker.tick()
         self.assertEqual(len(self.jira.comments), 5)
         self.assertEqual(self.state.get("LTRA-6")["phase"], "running")
         self.assertEqual(len(self.notifications), 5)
@@ -191,6 +190,93 @@ class WorkerTests(unittest.TestCase):
         self.worker.tick()
         self.assertEqual(self.state.get("LTRA-1")["phase"], "blocked")
         self.assertEqual(self.jira.transitions, [("LTRA-1", ["5"])])
+
+    def test_to_do_requeues_every_previous_phase_without_replaying_old_results(self):
+        for phase in ("released", "blocked", "failed", "blocking", "notifying_blocked",
+                      "review", "notifying", "running", "claiming", "preparing"):
+            with self.subTest(phase=phase):
+                self.jira.issues["LTRA-1"] = issue("LTRA-1")
+                self.state.save({"key": "LTRA-1", "phase": phase, "attempt": 2,
+                                 "branch": "dubloom/ltra-1", "repositories": {},
+                                 "result": {"outcome": "failed"}, "notification": "sent",
+                                 "blocked_notification": "sent", "error": "Old failure"})
+                self.assertEqual(self.worker.tick(), 1)
+                run = self.state.get("LTRA-1")
+                self.assertEqual(run["phase"], "running")
+                self.assertEqual(run["attempt"], 3)
+                self.assertEqual(run["branch"], "dubloom/ltra-1")
+                self.assertEqual(run["notification"], "pending")
+                self.assertNotIn("result", run)
+                self.assertNotIn("blocked_notification", run)
+                self.assertNotIn("error", run)
+                self.assertEqual(self.worker.tick(), 1)
+                self.assertEqual(self.state.get("LTRA-1")["attempt"], 3)
+        self.assertEqual(self.notifications, [])
+
+    def test_to_do_waits_for_capacity_then_requeues(self):
+        self.add(5, "3")
+        self.add(1, start=6)
+        self.state.save({"key": "LTRA-6", "phase": "blocked", "attempt": 1})
+        self.assertEqual(self.worker.tick(), 5)
+        self.assertEqual(self.jira.issue("LTRA-6")["fields"]["status"]["id"], "1")
+        self.jira.transition("LTRA-1", ["4"])
+        self.assertEqual(self.worker.tick(), 5)
+        self.assertEqual(self.state.get("LTRA-6")["attempt"], 2)
+
+    def test_manual_review_overrides_running_or_failed_checkpoint(self):
+        for phase in ("running", "failed", "verifying", "blocked"):
+            with self.subTest(phase=phase):
+                self.jira.issues["LTRA-1"] = issue("LTRA-1", "3")
+                self.state.save({"key": "LTRA-1", "phase": phase, "attempt": 1})
+                with patch.object(self.worker, "stop") as stop:
+                    self.assertEqual(self.worker.tick(), 1)
+                    stop.assert_called_once()
+                self.assertEqual(self.state.get("LTRA-1")["phase"], "review")
+                self.assertEqual(self.jira.issue("LTRA-1")["fields"]["status"]["id"], "3")
+        self.assertEqual(self.notifications, [])
+
+    def test_manual_blocked_stops_old_work_and_waits_for_ready(self):
+        self.add(1, "5")
+        self.state.save({"key": "LTRA-1", "phase": "running", "attempt": 1})
+        with patch.object(self.worker, "stop") as stop:
+            self.assertEqual(self.worker.tick(), 0)
+            self.assertTrue(stop.called)
+        self.assertEqual(self.worker.tick(), 0)
+        self.jira.transition("LTRA-1", ["6"])
+        self.assertEqual(self.worker.tick(), 1)
+        self.assertEqual(self.state.get("LTRA-1")["attempt"], 2)
+
+    def test_blocked_without_checkpoint_waits_for_ready(self):
+        self.add(1, "5")
+        self.assertEqual(self.worker.tick(), 0)
+        self.assertIsNone(self.state.get("LTRA-1"))
+        self.jira.transition("LTRA-1", ["6"])
+        self.assertEqual(self.worker.tick(), 1)
+        self.assertEqual(self.state.get("LTRA-1")["phase"], "running")
+        self.assertEqual(self.jira.issue("LTRA-1")["fields"]["status"]["id"], "2")
+
+    def test_new_failure_waits_for_manual_move_to_ready(self):
+        self.add(1, "2")
+        self.assertEqual(self.worker.tick(), 0)
+        self.assertTrue(Jira.is_blocked(self.jira.issue("LTRA-1")))
+        self.assertEqual(len(self.notifications), 1)
+        self.assertEqual(self.worker.tick(), 0)
+        self.jira.transition("LTRA-1", ["6"])
+        self.assertEqual(self.worker.tick(), 1)
+        self.assertEqual(self.state.get("LTRA-1")["phase"], "running")
+        self.assertEqual(len(self.notifications), 1)
+
+    def test_ready_respects_capacity_and_can_share_an_active_board_column(self):
+        self.worker.columns["In Progress"].append("6")
+        self.add(5, "3")
+        self.add(1, "6", start=6)
+        self.state.save({"key": "LTRA-6", "phase": "failed", "attempt": 2})
+        self.assertEqual(self.worker.tick(), 5)
+        self.assertEqual(self.jira.issue("LTRA-6")["fields"]["status"]["name"], "Ready")
+        self.jira.transition("LTRA-1", ["4"])
+        self.assertEqual(self.worker.tick(), 5)
+        self.assertEqual(self.state.get("LTRA-6")["phase"], "running")
+        self.assertEqual(self.state.get("LTRA-6")["attempt"], 3)
 
     def test_process_lock_and_project_state_guard(self):
         with self.assertRaisesRegex(ValueError, "Another worker"):
@@ -328,7 +414,7 @@ class WorkerTests(unittest.TestCase):
 
     def test_blocked_tickets_mapped_in_progress_do_not_consume_slots(self):
         self.worker.columns["In Progress"].append("5")
-        self.add(5, "5")
+        self.add(5, "5", managed=False)
         self.add(1, start=6)
         self.assertEqual(self.worker.tick(), 1)
         self.assertEqual(self.state.get("LTRA-6")["phase"], "running")
