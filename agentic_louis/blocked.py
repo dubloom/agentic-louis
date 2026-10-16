@@ -5,12 +5,34 @@ from pathlib import Path
 import subprocess
 import sys
 import uuid
+import sqlite3
+from contextlib import closing
 
 from .config import default_state_dir
 from .jira import Jira
 from .process import child_environment, identity
 from .projects import PROJECTS, is_managed, project_label
 from .terminal import blocked_tickets, make_console, selection_prompt
+
+
+def interrupted_session(launch):
+    """Best-effort recovery before the first turn-completion notification.
+
+    Codex's local database is an implementation detail; require an exact initial
+    prompt match and fail closed if its schema changes or matches are ambiguous.
+    """
+    if not launch.get("codex_home") or not launch.get("prompt"):
+        return None
+    matches = set()
+    for path in Path(launch["codex_home"]).glob("state_*.sqlite"):
+        try:
+            with closing(sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True, timeout=1)) as db:
+                rows = db.execute("SELECT id FROM threads WHERE cwd=? AND first_user_message=? AND source='cli'",
+                                  (launch["cwd"], launch["prompt"])).fetchall()
+                matches.update(str(uuid.UUID(row[0])) for row in rows)
+        except (sqlite3.Error, ValueError, TypeError, AttributeError):
+            continue
+    return next(iter(matches)) if len(matches) == 1 else None
 
 
 def session_for(run, project, state_dir, key):
@@ -25,6 +47,20 @@ def session_for(run, project, state_dir, key):
     launch = json.loads((attempt / "launch.json").read_text())
     if launch.get("token") != run.get("launch_token") or Path(launch["cwd"]).resolve() != directory:
         raise ValueError("Saved launch does not match this attempt.")
+    if launch.get("transport") == "tmux":
+        session_path = attempt / "session.json"
+        if not session_path.exists():
+            session = interrupted_session(launch)
+            if session:
+                return session, directory
+            raise ValueError("No saved Codex session ID for this attempt yet.")
+        saved = json.loads(session_path.read_text())
+        if saved.get("token") != run.get("launch_token"):
+            raise ValueError("Saved Codex session belongs to another attempt.")
+        try:
+            return str(uuid.UUID(saved["session_id"])), directory
+        except (KeyError, ValueError, TypeError, AttributeError):
+            raise ValueError("Saved Codex session ID is invalid.") from None
     with (attempt / "events.jsonl").open() as events:
         for line in events:
             try:

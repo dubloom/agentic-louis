@@ -16,11 +16,11 @@ class CommentTests(unittest.TestCase):
     def test_conversation_commands_are_exact_copyable_code_blocks(self):
         local = "codex resume session --cd '/path with spaces'"
         remote = "ssh -t workspace 'codex resume session --cd /task'"
-        watch = "tail -n +1 -f '/path with spaces/events.jsonl'"
-        remote_watch = "ssh -t workspace 'tail -n +1 -f /task/events.jsonl'"
-        body = comments.started(3, watch, remote_watch)
+        attach = "tmux -L agentic-louis-token attach-session -t agent"
+        remote_attach = "ssh -t workspace 'tmux -L agentic-louis-token attach-session -t agent'"
+        body = comments.started(3, attach, remote_attach)
         blocks = [node for node in body["content"] if node["type"] == "codeBlock"]
-        self.assertEqual([node["content"][0]["text"] for node in blocks], [remote_watch, watch])
+        self.assertEqual([node["content"][0]["text"] for node in blocks], [remote_attach, attach])
         self.assertTrue(all(node["attrs"]["language"] == "bash" for node in blocks))
         self.assertNotIn("resume", plain_text(body).casefold())
         for body in (comments.blocked({"error": "Tests failed"}, (local, remote)),
@@ -61,7 +61,7 @@ class CommentTests(unittest.TestCase):
 
     def test_transport_preserves_rich_body_without_mutation_and_finds_hidden_token(self):
         jira = object.__new__(Jira)
-        body = comments.started(1, "tail log", "ssh workspace tail log")
+        body = comments.started(1, "tmux attach", "ssh workspace tmux attach")
         original = deepcopy(body)
         with patch.object(jira, "get", return_value={"comments": [], "total": 0}), patch.object(jira, "request") as write:
             jira.comment_once("LTRA-11", "[token]", body)

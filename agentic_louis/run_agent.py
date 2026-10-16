@@ -7,8 +7,102 @@ import signal
 import subprocess
 import sys
 import time
+import uuid
 
-from .process import atomic_json, child_environment, identity
+# tmux and Codex's notification callback invoke this file from task directories.
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from agentic_louis.process import atomic_json, child_environment, command, CommandError, identity
+from agentic_louis.tmux import stop_terminal, terminal_args
+
+
+def notify(directory, token, payload):
+    """Persist the session ID and hand off results only after a complete turn."""
+    launch = json.loads((directory / "launch.json").read_text())
+    if launch.get("token") != token:
+        raise ValueError("Notification belongs to another launch.")
+    event = json.loads(payload)
+    if event.get("type") != "agent-turn-complete":
+        return
+    if Path(event.get("cwd", "")).resolve() != Path(launch["cwd"]).resolve():
+        return
+    session = str(uuid.UUID(event["thread-id"]))
+    atomic_json(directory / "session.json", {"token": token, "session_id": session})
+    if (directory / "result.json").is_file():
+        atomic_json(directory / "completion.json", {"token": token, "session_id": session})
+
+
+def terminal(directory):
+    launch = json.loads((directory / "launch.json").read_text())
+    # tmux makes its pane process a process-group leader. Codex and its local
+    # runtime stay in that group; --no-daemon prevents an unowned shared runtime.
+    atomic_json(directory / "child.json", {"pid": os.getpid(), "identity": identity(os.getpid()),
+                                           "token": launch["token"]})
+    exit_code = subprocess.call(launch["args"], cwd=launch["cwd"], env=child_environment())
+    atomic_json(directory / "terminal-exit.json", {"exit_code": exit_code, "token": launch["token"]})
+    return exit_code
+
+
+def supervise_terminal(directory, launch):
+    exit_code, error = 1, None
+    stopping = False
+
+    def terminate(signum, frame):
+        nonlocal stopping
+        # Finish the bounded tmux startup before cleanup. Raising inside
+        # new-session could leave a server starting after cleanup has finished.
+        stopping = True
+
+    signal.signal(signal.SIGTERM, terminate)
+    signal.signal(signal.SIGINT, terminate)
+    try:
+        command(terminal_args(launch) + ["new-session", "-d", "-s", "agent", "-x", "160", "-y", "48",
+                                       "-c", str(directory), sys.executable, str(Path(__file__).resolve()),
+                                       "terminal", str(directory)], timeout=10)
+        atomic_json(directory / "terminal.json", {"token": launch["token"]})
+        deadline = time.monotonic() + launch["timeout"]
+        while True:
+            if stopping:
+                error = "Worker stopped this run."
+                break
+            completion = directory / "completion.json"
+            if completion.exists():
+                if json.loads(completion.read_text()).get("token") != launch["token"]:
+                    raise ValueError("Completion belongs to another launch.")
+                if not (directory / "result.json").is_file():
+                    raise ValueError("Codex completed without a result file.")
+                exit_code = 0
+                break
+            terminal_exit = directory / "terminal-exit.json"
+            if terminal_exit.exists():
+                saved = json.loads(terminal_exit.read_text())
+                if saved.get("token") != launch["token"]:
+                    raise ValueError("Terminal exit belongs to another launch.")
+                error = f"Codex terminal exited with code {saved['exit_code']} before submitting a completed result."
+                break
+            if time.monotonic() >= deadline:
+                error = "Codex exceeded the configured run timeout."
+                break
+            command(terminal_args(launch) + ["has-session", "-t", "agent"], timeout=5)
+            time.sleep(0.2)
+    except (OSError, ValueError) as exc:
+        error = f"Codex terminal stopped: {exc}"
+    finally:
+        # Ignore subsequent signals while cleaning up the detached tmux server.
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+        try:
+            output = command(terminal_args(launch) + ["capture-pane", "-p", "-S", "-", "-t", "agent"], timeout=5)
+            (directory / "terminal.log").write_text(output)
+        except (OSError, CommandError):
+            pass
+        try:
+            stop_terminal(directory, launch["token"])
+        except (OSError, ValueError) as exc:
+            exit_code = 1
+            error = (error + " " if error else "") + f"Terminal cleanup failed: {exc}"
+        atomic_json(directory / "exit.json", {"exit_code": exit_code, "error": error, "token": launch["token"]})
 
 
 def main():
@@ -17,6 +111,9 @@ def main():
     # flock in the worker does not leak to this process.
     atomic_json(directory / "supervisor.json", {"pid": os.getpid(), "identity": identity(os.getpid()),
                                                 "started": time.time(), "token": launch["token"]})
+    if launch.get("transport") == "tmux":
+        supervise_terminal(directory, launch)
+        return
     process = None
 
     def stop_family():
@@ -61,4 +158,9 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) > 1 and sys.argv[1] == "notify":
+        notify(Path(sys.argv[2]).resolve(), sys.argv[3], sys.argv[4])
+    elif len(sys.argv) > 1 and sys.argv[1] == "terminal":
+        sys.exit(terminal(Path(sys.argv[2]).resolve()))
+    else:
+        main()

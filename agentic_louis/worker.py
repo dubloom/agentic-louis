@@ -24,7 +24,7 @@ from .process import CommandError, atomic_json, child_environment, command, iden
 from .projects import LIMIT, is_managed, project_label
 from .state import State
 from .webhook import send, validate_webhook
-from .watch import watch_attempt
+from .tmux import stop_terminal, terminal_args, terminal_launch
 
 
 LOG = logging.getLogger("workspace-worker")
@@ -48,8 +48,12 @@ class Worker:
             raise ValueError("The worker needs permission to inspect process identities through ps.")
         command(["codex", "--version"])
         command(["codex", "login", "status"])
-        help_text = command(["codex", "exec", "--help"])
-        for flag in ("--output-schema", "--json", "--output-last-message", "--profile", "--ignore-user-config"):
+        tmux_version = command(["tmux", "-V"])
+        version = re.search(r"(\d+)\.(\d+)", tmux_version)
+        if not version or tuple(map(int, version.groups())) < (3, 2):
+            raise ValueError("Interactive attempts require tmux 3.2 or later.")
+        help_text = command(["codex", "--help"])
+        for flag in ("--no-daemon", "--no-alt-screen", "--profile"):
             if flag not in help_text:
                 raise ValueError(f"Installed Codex does not support {flag}.")
         if self.config.profile:
@@ -320,13 +324,13 @@ class Worker:
                 focus = (worktree / repo.folder).resolve()
                 if not focus.is_relative_to(worktree) or not focus.is_dir():
                     raise ValueError(f"Configured folder is unavailable inside the worktree for {repo.name}: {repo.folder}")
-        args = ["codex", "--ask-for-approval", "never", "exec",
+        args = ["codex", "--ask-for-approval", "never", "--no-daemon", "--no-alt-screen",
                 "--model", "gpt-6.1-sol",
-                "--ignore-user-config", "-c", 'default_permissions="agentic-task"',
+                "-c", 'default_permissions="agentic-task"',
                 "-c", 'permissions.agentic-task.extends=":workspace"',
                 "-c", 'permissions.agentic-task.network.enabled=true',
-                "--json", "--output-schema", str(SCHEMA), "--output-last-message", str(attempt / "result.json"),
-                "--cd", str(directory), "--skip-git-repo-check"]
+                "--cd", str(directory),
+                "-c", f"projects.{json.dumps(str(directory))}.trust_level=\"trusted\""]
         if self.config.profile:
             args.extend(["--profile", self.config.profile])
         # Worktree Git metadata lives in the original repositories.
@@ -336,11 +340,13 @@ class Worker:
             metadata[common] = "write"
         table = ", ".join(f"{json.dumps(path)} = {json.dumps(access)}" for path, access in metadata.items())
         args.extend(["-c", "permissions.agentic-task.filesystem={" + table + "}"])
-        args.append("-")
         prompt = self.prompt(run, issue)
         token = str(uuid.uuid4())
+        callback = [sys.executable, str(Path(__file__).with_name("run_agent.py")), "notify", str(attempt), token]
+        args.extend(["-c", "notify=" + json.dumps(callback), prompt])
         atomic_json(attempt / "launch.json", {"token": token, "args": args, "cwd": str(directory),
-                                              "timeout": self.config.timeout, "prompt": prompt})
+                                              "codex_home": str(Path(os.getenv("CODEX_HOME", Path.home() / ".codex")).expanduser().resolve()),
+                                              "transport": "tmux", "timeout": self.config.timeout, "prompt": prompt})
         run.update(phase="running", launch_token=token, launched_at=time.time())
         self.state.save(run)
         log = (attempt / "supervisor.log").open("ab")
@@ -377,7 +383,11 @@ class Worker:
             "Include the Jira URL and validation results in each PR. All PRs MUST remain drafts. Never merge or mark ready.\n"
             "Check for an existing PR on this branch before creating one. Reuse it on a retry.\n"
             "Do not change Jira or send notifications. The worker handles those actions.\n"
-            "Return the required structured result with every PR, validation evidence, and an implementation summary.\n"
+            "As your FINAL tool action, write the structured result JSON to "
+            f"{Path(run['attempt_dir']) / 'result.json'} using an atomic rename from a temporary file in the same directory. "
+            "Do not write that file until all work is finished. Then end your turn; the supervisor will close this terminal.\n"
+            f"The result MUST match this JSON Schema: {SCHEMA.read_text().strip()}\n"
+            f"Result file: {Path(run['attempt_dir']) / 'result.json'}\n"
             "For each PR, set repository to the exact configured github value (owner/repository), not its local name.\n"
             f"Branch: {run['branch']}\nJira: {self.jira.site}/browse/{run['key']}\n"
             f"Repositories: {json.dumps(repos)}\nPrevious error: {run.get('error', 'None')}\n"
@@ -400,6 +410,7 @@ class Worker:
     def stop(self, run):
         if not run.get("attempt_dir"):
             return
+        stop_terminal(run["attempt_dir"], run.get("launch_token"))
         meta = self.read_metadata(run, "supervisor.json")
         if meta is None and run.get("supervisor_pid"):
             meta = {"pid": run["supervisor_pid"], "identity": run.get("supervisor_identity")}
@@ -443,18 +454,21 @@ class Worker:
         if run.get("started_commented") == run.get("attempt", 0):
             return
         try:
-            session_for(run, self.config.project, self.config.state_dir, run["key"])
+            launch = terminal_launch(run["attempt_dir"], run.get("launch_token"))
+            if not launch:
+                return
+            meta = self.read_metadata(run, "terminal.json")
+            if not meta:
+                return
         except (ValueError, OSError):
-            # The supervisor may not have emitted thread.started yet.
+            # The supervisor may not have created the terminal yet.
             return
         host = f"workspace-dubloom-{self.config.project}"
-        watch = shlex.join(["agentic-louis", "--project", self.config.project,
-                            "--state-dir", str(self.config.state_dir), "watch", run["key"],
-                            "--attempt", str(run["attempt"])])
-        remote_watch = shlex.join(["ssh", "-t", host, watch])
+        attach = shlex.join(terminal_args(launch) + ["attach-session", "-t", "agent"])
+        remote_attach = shlex.join(["ssh", "-t", host, attach])
         self.jira.comment_once(
             run["key"], f"[agentic-louis:{run['key']}:started:{run.get('attempt', 0)}]",
-            comments.started(run.get("attempt", 0), watch, remote_watch))
+            comments.started(run.get("attempt", 0), attach, remote_attach))
         run["started_commented"] = run.get("attempt", 0)
         self.state.save(run)
 
@@ -674,14 +688,13 @@ def main(argv=None):
     parser.add_argument("--state-dir", type=Path, help="Override the persistent state directory.")
     parser.add_argument("--profile", help="Optional Codex profile name.")
     parser.add_argument("--config", type=Path, help="Workspace JSON file (default: ./agentic-louis.json when present).")
-    parser.add_argument("action", nargs="?", choices=("run", "status", "blocked", "watch", "resume", "retry", "resend", "check"), default="run")
+    parser.add_argument("action", nargs="?", choices=("run", "status", "blocked", "resume", "retry", "resend", "check"), default="run")
     parser.add_argument("key", nargs="?")
-    parser.add_argument("--attempt", type=int, help="Saved attempt number required by watch and resume.")
-    parser.add_argument("--full-output", action="store_true", help="Show unabridged command output with watch.")
+    parser.add_argument("--attempt", type=int, help="Saved attempt number required by resume.")
     parser.add_argument("--dry-run", action="store_true", help="Check prerequisites and show matching tasks without mutations.")
     args = parser.parse_args(argv)
     config_path = args.config
-    if config_path is None and args.action not in {"blocked", "status", "watch", "resume"}:
+    if config_path is None and args.action not in {"blocked", "status", "resume"}:
         candidate = Path.cwd() / "agentic-louis.json"
         if candidate.is_file():
             config_path = candidate
@@ -689,7 +702,7 @@ def main(argv=None):
         parser.error("--project is required for this action")
     if args.action == "blocked" and args.state_dir and not args.project and config_path is None:
         parser.error("--state-dir requires --project with blocked")
-    if args.action in {"watch", "resume"} and (not args.key or args.attempt is None):
+    if args.action == "resume" and (not args.key or args.attempt is None):
         parser.error(f"{args.action} requires a Jira issue key and --attempt")
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     state = None
@@ -703,10 +716,6 @@ def main(argv=None):
             return open_blocked(Jira(), project=args.project, state_dir=args.state_dir, profile=args.profile,
                                 key=args.key, dry_run=args.dry_run)
         project_label(args.project)
-        if args.action == "watch":
-            directory = args.state_dir.expanduser().resolve() if args.state_dir else default_state_dir(args.project)
-            return watch_attempt(state_dir=directory, key=args.key, attempt=args.attempt,
-                                 full_output=args.full_output, follow=not args.dry_run)
         if args.action == "resume":
             directory = args.state_dir.expanduser().resolve() if args.state_dir else default_state_dir(args.project)
             return resume_attempt(Jira(config.board_url) if config else Jira(), project=args.project,

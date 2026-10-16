@@ -234,7 +234,8 @@ class WorkerTests(unittest.TestCase):
         self.worker.config = replace(self.config, repositories=(focused, whole))
         paths = {repo.name: {"path": str(self.root / "runs" / "LTRA-1" / "repositories" / repo.name)}
                  for repo in (focused, whole)}
-        run = {"branch": "dubloom/ltra-1", "key": "LTRA-1", "repositories": paths}
+        run = {"branch": "dubloom/ltra-1", "key": "LTRA-1", "repositories": paths,
+               "attempt_dir": str(self.root / "runs" / "LTRA-1" / "attempt-1")}
         prompt = self.worker.prompt(run, issue("LTRA-1"))
         repos = json.loads(prompt.split("Repositories: ", 1)[1].split("\nPrevious error:", 1)[0])
         self.assertEqual(repos[0]["focus_path"], str(Path(paths["backend"]["path"]) / "src/api"))
@@ -495,25 +496,26 @@ class WorkerTests(unittest.TestCase):
         run = {"key": "LTRA-1", "phase": "running", "attempt": attempt,
                "attempt_dir": str(attempt_dir), "launch_token": "token"}
         self.state.save(run)
-        atomic_json(attempt_dir / "launch.json", {"token": "token", "cwd": str(directory)})
+        atomic_json(attempt_dir / "launch.json", {"token": "token", "cwd": str(directory), "transport": "tmux"})
         atomic_json(attempt_dir / "supervisor.json", {"token": "token", "pid": 123, "identity": "start"})
         return run, attempt_dir
 
-    def test_start_comment_waits_for_session_and_survives_restart(self):
+    def test_start_comment_waits_for_terminal_and_survives_restart(self):
         run, attempt = self.conversation_run()
         self.worker.launch_directory = self.root / "launch 'directory' $(literal)"
         session = "12345678-1234-1234-1234-123456789abc"
         with patch("agentic_louis.worker.identity", return_value="start"):
             Worker.collect(self.worker, run)
             self.assertEqual(self.jira.comments, {})
-            (attempt / "events.jsonl").write_text(json.dumps({"type": "thread.started", "thread_id": session}) + "\n")
+            atomic_json(attempt / "terminal.json", {"token": "token"})
             Worker.collect(self.worker, run)
         text = next(iter(self.jira.comments.values()))[1]
         commands = [shlex.split(line) for line in text.splitlines() if line.startswith("ssh ")]
         self.assertEqual(len(commands), 1)
         self.assertNotIn("resume", text.casefold())
-        self.assertEqual(shlex.split(commands[0][3]), ["agentic-louis", "--project", "trajectory",
-                                                     "--state-dir", str(self.root), "watch", "LTRA-1", "--attempt", "1"])
+        self.assertEqual(shlex.split(commands[0][3]), ["tmux", "-L", "agentic-louis-token", "-f", "/dev/null",
+                                                     "attach-session", "-t", "agent"])
+        atomic_json(attempt / "session.json", {"token": "token", "session_id": session})
         local, remote = self.worker.resume_commands(run)
         ssh = shlex.split(remote)
         self.assertEqual(ssh[:3], ["ssh", "-t", "workspace-dubloom-trajectory"])
@@ -528,8 +530,7 @@ class WorkerTests(unittest.TestCase):
 
     def test_start_comment_retries_jira_error_without_stopping_agent(self):
         run, attempt = self.conversation_run()
-        (attempt / "events.jsonl").write_text(json.dumps({"type": "thread.started", "thread_id":
-                                                        "12345678-1234-1234-1234-123456789abc"}) + "\n")
+        atomic_json(attempt / "terminal.json", {"token": "token"})
         self.jira.comment_error = ApiError("Unavailable", retryable=True)
         with self.assertRaises(ApiError), patch.object(self.worker, "stop") as stop:
             Worker.collect(self.worker, run)
@@ -541,21 +542,19 @@ class WorkerTests(unittest.TestCase):
 
     def test_blocked_comment_has_guarded_resume_only_when_session_exists(self):
         run, attempt = self.conversation_run()
-        (attempt / "events.jsonl").write_text(json.dumps({"type": "thread.started", "thread_id":
-                                                        "12345678-1234-1234-1234-123456789abc"}) + "\n")
+        atomic_json(attempt / "session.json", {"token": "token", "session_id": "12345678-1234-1234-1234-123456789abc"})
         run["error"] = "Tests failed"
         self.worker.error_comment(run)
         body = self.jira.comments["[agentic-louis:LTRA-1:blocked:1]"][1]
         self.assertIn("resume LTRA-1 --attempt 1", body)
         self.assertNotIn("tail -n", body)
-        (attempt / "events.jsonl").unlink()
+        (attempt / "session.json").unlink()
         self.assertIsNone(self.worker.resume_commands(run))
 
     def test_each_attempt_gets_its_own_conversation_comment(self):
         for number in (1, 2):
             run, attempt = self.conversation_run(number)
-            (attempt / "events.jsonl").write_text(json.dumps({"type": "thread.started", "thread_id":
-                                                            f"12345678-1234-1234-1234-{number:012d}"}) + "\n")
+            atomic_json(attempt / "terminal.json", {"token": "token"})
             self.worker.started_comment(run)
             # Reconcile an uncertain Jira write before its checkpoint was saved.
             run.pop("started_commented")
@@ -787,6 +786,8 @@ class GitVerificationTests(unittest.TestCase):
         with patch.dict(os.environ, {"PATH": str(binary_dir) + os.pathsep + os.environ["PATH"]}):
             worker.prepare(run, self.jira.issue("LTRA-1"))
             worker.children["LTRA-1"].wait(timeout=15)
+        exit_data = json.loads((Path(run["attempt_dir"]) / "exit.json").read_text())
+        self.assertIsNone(exit_data["error"], exit_data)
         self.assertEqual(run["branch"], "dubloom/ltra-1")
         launch = json.loads((Path(run["attempt_dir"]) / "launch.json").read_text())
         self.assertEqual(launch["args"][launch["args"].index("--model") + 1], "gpt-6.1-sol")
@@ -812,7 +813,7 @@ class GitVerificationTests(unittest.TestCase):
         self.assertEqual(len(messages), 1)
         started = self.jira.comments["[agentic-louis:LTRA-1:started:1]"][1]
         self.assertNotIn("resume", started.casefold())
-        self.assertIn("watch LTRA-1 --attempt 1", started)
+        self.assertIn("attach-session -t agent", started)
         self.assertIn("ssh -t workspace-dubloom-trajectory", started)
         review = self.jira.comments["[agentic-louis:LTRA-1:ready:1]"][1]
         self.assertIn("resume LTRA-1 --attempt 1", review)
@@ -875,11 +876,14 @@ class SharedTests(unittest.TestCase):
 
 FAKE_CODEX = r"""
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
-prompt = sys.stdin.read()
-print(json.dumps({"type": "thread.started", "thread_id": "12345678-1234-1234-1234-123456789abc"}), flush=True)
+import time
+assert sys.stdin.isatty() and sys.stdout.isatty()
+assert 'JIRA_API_TOKEN' not in os.environ and 'SLACK_WORKFLOW_URL' not in os.environ
+prompt = sys.argv[-1]
 repositories = json.loads(next(line.removeprefix("Repositories: ") for line in prompt.splitlines() if line.startswith("Repositories: ")))
 branch = next(line.removeprefix("Branch: ") for line in prompt.splitlines() if line.startswith("Branch: "))
 prs = []
@@ -890,9 +894,13 @@ for repo in repositories:
         subprocess.run(args, cwd=path, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     prs.append({"repository": repo["github"], "url": "https://github.com/" + repo["github"] + "/pull/1"})
 result = {"outcome": "success", "summary": "Implemented task", "validation": "Git diff checks passed", "prs": prs}
-output = Path(sys.argv[sys.argv.index("--output-last-message") + 1])
+output = Path(next(line.removeprefix("Result file: ") for line in prompt.splitlines() if line.startswith("Result file: ")))
 output.write_text(json.dumps(result))
-print(json.dumps({"type": "turn.completed"}))
+callback = json.loads(next(arg.removeprefix("notify=") for arg in sys.argv if arg.startswith("notify=")))
+subprocess.run(callback + [json.dumps({'type': 'agent-turn-complete', 'thread-id': '12345678-1234-1234-1234-123456789abc',
+                                      'cwd': os.getcwd()})], check=True)
+print('Task completed; waiting for supervisor.', flush=True)
+time.sleep(60)
 """
 
 

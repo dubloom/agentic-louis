@@ -27,8 +27,8 @@ Queue work from your local agent and run Codex on remote project workspaces. Jir
 The remote machine needs:
 
 - **Python 3.10 or later** on macOS or Linux.
-- **Git**, **GitHub CLI**, and **Codex CLI**.
-- **Codex CLI 0.162.1 or later** with support for permission profiles. A separate worker profile is optional.
+- **Git**, **GitHub CLI**, **tmux 3.2 or later**, and **Codex CLI**.
+- **Codex CLI** with support for permission profiles, `--no-daemon`, and `--no-alt-screen` (tested with 0.163.0). A separate worker profile is optional.
 
 ### Install and configure credentials
 
@@ -220,16 +220,27 @@ It polls every five seconds and uses a two-hour run timeout.
 Each task gets native Git worktrees and a `dubloom/<ticket-key>` branch across the discovered repositories.
 Retries reuse existing branches, including branches created with the previous prefix.
 
-Once Codex starts its conversation, the next worker poll adds a Jira comment with
-commands to watch that attempt's saved event log, either from your laptop over
-SSH or directly on the worker workspace. The `agentic-louis watch TICKET --attempt NUMBER`
-command shows agent messages, commands, file changes, and concise command output
-as they arrive, without opening a Codex client. Large command outputs show only
-their last eight lines (up to 1,600 characters); add `--full-output` for the full
-output. Add `--dry-run` to print the saved progress without following new events.
-Press Ctrl-C to stop watching; the agent keeps running. Watching also exits when
-the supervised agent process finishes. Each attempt gets one start comment,
-including retries. The raw `events.jsonl` remains available for diagnostics.
+Each attempt runs interactive Codex inside a private tmux server. The next
+worker poll adds a short Jira comment with commands to attach to that exact
+terminal from your laptop over SSH or directly on the worker workspace. You can
+watch progress and give instructions in the same conversation. Detach with
+**Ctrl-B, then d** to leave the agent running. Ctrl-C goes to Codex and may
+interrupt its active turn; exiting Codex before it submits a result blocks the
+attempt. Attaching never starts a second Codex client. Each attempt gets one
+start comment, including retries.
+
+Codex runs with `--no-daemon`, so its runtime stays owned by the supervised
+terminal. At completion, the agent atomically writes `result.json`, and Codex's
+turn-completion notification records the conversation ID and signals the
+supervisor to close the terminal. The worker then validates the result and PRs
+as before. A timeout, cancellation, or abandoned terminal triggers cleanup of
+that attempt's tmux server and process group. A terminal snapshot is saved as
+`terminal.log` when available.
+
+If an attempt stops before its first turn completes, resume discovery also
+checks the launch account's local Codex state database for an exact match to
+the task directory and initial prompt. Ambiguous matches or an unsupported
+database schema leave resume unavailable rather than opening another task.
 
 The Blocked and In Review comments provide
 `agentic-louis --project PROJECT --state-dir PATH resume TICKET --attempt NUMBER`
@@ -242,7 +253,9 @@ commands from older attempts after a retry. Use the worker's Codex account and
 its `.env` is loaded; the SSH command does this automatically. Avoid direct
 `codex resume` while the worker is running, since another client can interrupt
 the active conversation. Existing Jira comments retain their original commands;
-these watch and guarded resume commands appear on new attempts.
+these attach and guarded resume commands appear on new attempts. Existing
+non-interactive attempts remain collectable across an upgrade; new attempts
+use tmux.
 
 Worker comments use native Jira headings, code blocks for commands and diagnostics,
 and labeled branch and PR links. Automation references and detailed failure logs
@@ -254,7 +267,10 @@ Use `--state-dir /path/to/state` to override the default state directory.
 New agent runs explicitly use `gpt-6.1-sol`, overriding any model set in a profile.
 Use `--profile NAME` to load `$CODEX_HOME/NAME.config.toml` for additional Codex settings.
 Without `--profile`, no worker profile file is needed.
-The worker skips the base Codex configuration and applies task permissions itself.
+Interactive Codex loads the worker account's base configuration and optional
+profile. The worker overrides the model, task permissions, and `notify` command
+for its result handoff, trusts the generated task directory, and disables the
+shared Codex daemon.
 It grants Git metadata writes for discovered repositories so Codex can commit changes.
 Jira credentials and the Slack webhook URL are removed from child process environments.
 
@@ -348,7 +364,7 @@ Run this while the worker is running:
 agentic-louis --project trajectory status
 ```
 
-Git worktrees, process metadata, events, results, and validation logs live under the project artifact directory. Task tracking stays in Jira. **Keep this directory across restarts.**
+Git worktrees, process metadata, results, terminal snapshots, and validation logs live under the project artifact directory. Task tracking stays in Jira. **Keep this directory across restarts.**
 
 ### Restart the worker
 
@@ -439,4 +455,4 @@ python3 -m unittest discover -s tests -v
 Tests use mocked services and temporary Git repositories. They do not create live Jira tickets, GitHub PRs, or Slack messages.
 
 Installation uses [pipx](https://pipx.pypa.io/latest/how-to/install-pipx.html).
-The worker uses [Codex non-interactive mode](https://learn.chatgpt.com/docs/non-interactive-mode) and [GitHub CLI](https://cli.github.com/manual/gh_pr_view).
+The worker uses [Codex CLI](https://learn.chatgpt.com/docs/developer-commands?surface=cli) in tmux and [GitHub CLI](https://cli.github.com/manual/gh_pr_view).

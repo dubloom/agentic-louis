@@ -59,12 +59,13 @@ def links(urls):
     return {"type": "bulletList", "content": items}
 
 
-def started(attempt, watch_command, remote_watch_command):
+def started(attempt, attach_command, remote_attach_command):
     return document(
         heading(f"Agent started · attempt {attempt}", 3),
-        paragraph("Watch progress live. Press Ctrl-C to stop watching; the agent keeps running."),
-        heading("Watch from your laptop"), code(remote_watch_command, "bash"),
-        heading("Watch on the worker workspace"), code(watch_command, "bash"))
+        paragraph("Attach to the running Codex terminal to watch or give instructions. "
+                  "Detach with Ctrl-B, then d; the agent keeps running."),
+        heading("Attach from your laptop"), code(remote_attach_command, "bash"),
+        heading("Attach on the worker workspace"), code(attach_command, "bash"))
 
 
 def resume_nodes(commands):

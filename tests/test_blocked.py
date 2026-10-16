@@ -8,13 +8,14 @@ import tempfile
 import unittest
 from unittest.mock import patch
 import uuid
+import sqlite3
 
 from prompt_toolkit.input import create_pipe_input
 from prompt_toolkit.output import DummyOutput
 import questionary
 from rich.console import Console
 
-from agentic_louis.blocked import session_for
+from agentic_louis.blocked import interrupted_session, session_for
 from agentic_louis.process import atomic_json
 from agentic_louis.state import State
 from agentic_louis.worker import main
@@ -263,6 +264,26 @@ class BlockedTests(unittest.TestCase):
             self.assertEqual(main(["blocked", "LTRA-1"]), 1)
         self.assertIn("No Codex session ID", " ".join(logs.output))
         self.launch.assert_not_called()
+
+    def test_interrupted_terminal_session_requires_exact_unambiguous_prompt(self):
+        run, session, task = self.saved_run()
+        attempt = Path(run["attempt_dir"])
+        codex_home = self.root / "codex-home"
+        codex_home.mkdir()
+        launch = {"token": run["launch_token"], "cwd": str(task), "transport": "tmux",
+                  "codex_home": str(codex_home), "prompt": "unique attempt prompt"}
+        atomic_json(attempt / "launch.json", launch)
+        with sqlite3.connect(codex_home / "state_5.sqlite") as db:
+            db.execute("CREATE TABLE threads (id TEXT, cwd TEXT, first_user_message TEXT, source TEXT)")
+            db.execute("INSERT INTO threads VALUES (?, ?, ?, 'cli')", (session, str(task), "other attempt"))
+            db.commit()
+            self.assertIsNone(interrupted_session(launch))
+            db.execute("INSERT INTO threads VALUES (?, ?, ?, 'cli')", (session, str(task), launch["prompt"]))
+            db.commit()
+            self.assertEqual(session_for(run, "trajectory", task.parent.parent, run["key"]), (session, task))
+            db.execute("INSERT INTO threads VALUES (?, ?, ?, 'cli')", (str(uuid.uuid4()), str(task), launch["prompt"]))
+            db.commit()
+            self.assertIsNone(interrupted_session(launch))
 
     def test_unavailable_or_mismatched_artifacts_never_launch(self):
         run, _, task = self.saved_run()
