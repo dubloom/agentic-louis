@@ -14,7 +14,8 @@ from urllib.parse import quote
 
 from dotenv import load_dotenv
 
-from .blocked import open_blocked, session_for
+from .blocked import open_blocked, resume_attempt, session_for
+from . import comments
 from .config import Workspace, default_state_dir, github_repository
 from .github import GitHub
 from . import ROOT
@@ -23,6 +24,7 @@ from .process import CommandError, atomic_json, child_environment, command, iden
 from .projects import LIMIT, is_managed, project_label
 from .state import State
 from .webhook import send, validate_webhook
+from .watch import watch_attempt
 
 
 LOG = logging.getLogger("workspace-worker")
@@ -100,13 +102,7 @@ class Worker:
         if run.get("blocked_commented") == run.get("attempt", 0):
             return
         token = f"[agentic-louis:{run['key']}:blocked:{run.get('attempt', 0)}]"
-        self.jira.comment_once(run["key"], token,
-                               "Agent work failed. Moving the ticket to Blocked.\n"
-                               + run.get("error", "Unknown error")
-                               + "\n" + "\n".join(run.get("partial_prs", []))
-                               + "\n\nSaved branches\n" + ("\n".join(run.get("partial_branches", [])) or "None published.")
-                               + "\n" + "\n".join(run.get("branch_publication_errors", []))
-                               + "\nInspect the worker status and run logs, then move this ticket to Ready to retry.")
+        self.jira.comment_once(run["key"], token, comments.blocked(run, self.resume_commands(run)))
         run["blocked_commented"] = run.get("attempt", 0)
         self.state.save(run)
 
@@ -427,27 +423,38 @@ class Worker:
         except ProcessLookupError:
             pass
 
+    def resume_commands(self, run):
+        try:
+            session_for(run, self.config.project, self.config.state_dir, run["key"])
+        except (ValueError, OSError):
+            return None  # Setup failures may have no saved conversation.
+        args = ["agentic-louis", "--project", self.config.project,
+                "--state-dir", str(self.config.state_dir), "resume", run["key"],
+                "--attempt", str(run["attempt"])]
+        if self.config.profile:
+            args.extend(["--profile", self.config.profile])
+        local = shlex.join(args)
+        host = f"workspace-dubloom-{self.config.project}"
+        remote = shlex.join(["ssh", "-t", host,
+                             f"cd {shlex.quote(str(self.launch_directory))} && {local}"])
+        return local, remote
+
     def started_comment(self, run):
         if run.get("started_commented") == run.get("attempt", 0):
             return
         try:
-            session, directory = session_for(run, self.config.project, self.config.state_dir, run["key"])
+            session_for(run, self.config.project, self.config.state_dir, run["key"])
         except (ValueError, OSError):
             # The supervisor may not have emitted thread.started yet.
             return
-        args = ["codex", "resume", session, "--cd", str(directory), "--ask-for-approval", "on-request"]
-        if self.config.profile:
-            args.extend(["--profile", self.config.profile])
-        local = shlex.join(args)
-        remote = shlex.join(["ssh", "-t", f"workspace-dubloom-{self.config.project}", local])
+        host = f"workspace-dubloom-{self.config.project}"
+        watch = shlex.join(["agentic-louis", "--project", self.config.project,
+                            "--state-dir", str(self.config.state_dir), "watch", run["key"],
+                            "--attempt", str(run["attempt"])])
+        remote_watch = shlex.join(["ssh", "-t", host, watch])
         self.jira.comment_once(
             run["key"], f"[agentic-louis:{run['key']}:started:{run.get('attempt', 0)}]",
-            f"Agent started working on this ticket (attempt {run.get('attempt', 0)}).\n\n"
-            "Open this attempt's Codex conversation from your laptop:\n"
-            + remote + "\n\nOr run on the worker workspace:\n" + local
-            + "\n\nUse the worker's Codex account and CODEX_HOME. "
-            "While the agent is running, use the conversation for inspection; "
-            "wait for it to stop before submitting instructions in the resumed session.")
+            comments.started(run.get("attempt", 0), watch, remote_watch))
         run["started_commented"] = run.get("attempt", 0)
         self.state.save(run)
 
@@ -566,11 +573,8 @@ class Worker:
                 run["phase"] = "commenting"
                 self.state.save(run)
             if run["phase"] == "commenting":
-                result = run["result"]
                 self.jira.comment_once(run["key"], f"[agentic-louis:{run['key']}:ready:{run.get('attempt', 0)}]",
-                    result["summary"] + "\n\nValidation\n" + result["validation"]
-                    + "\n" + "\n".join(run.get("verified_checks", []))
-                    + "\n\nDraft PRs\n" + "\n".join(pr["url"] for pr in result["prs"]))
+                                       comments.ready(run, self.resume_commands(run)))
                 run["phase"] = "transitioning"
                 self.state.save(run)
             if run["phase"] == "transitioning":
@@ -670,12 +674,14 @@ def main(argv=None):
     parser.add_argument("--state-dir", type=Path, help="Override the persistent state directory.")
     parser.add_argument("--profile", help="Optional Codex profile name.")
     parser.add_argument("--config", type=Path, help="Workspace JSON file (default: ./agentic-louis.json when present).")
-    parser.add_argument("action", nargs="?", choices=("run", "status", "blocked", "retry", "resend", "check"), default="run")
+    parser.add_argument("action", nargs="?", choices=("run", "status", "blocked", "watch", "resume", "retry", "resend", "check"), default="run")
     parser.add_argument("key", nargs="?")
+    parser.add_argument("--attempt", type=int, help="Saved attempt number required by watch and resume.")
+    parser.add_argument("--full-output", action="store_true", help="Show unabridged command output with watch.")
     parser.add_argument("--dry-run", action="store_true", help="Check prerequisites and show matching tasks without mutations.")
     args = parser.parse_args(argv)
     config_path = args.config
-    if config_path is None and args.action not in {"blocked", "status"}:
+    if config_path is None and args.action not in {"blocked", "status", "watch", "resume"}:
         candidate = Path.cwd() / "agentic-louis.json"
         if candidate.is_file():
             config_path = candidate
@@ -683,6 +689,8 @@ def main(argv=None):
         parser.error("--project is required for this action")
     if args.action == "blocked" and args.state_dir and not args.project and config_path is None:
         parser.error("--state-dir requires --project with blocked")
+    if args.action in {"watch", "resume"} and (not args.key or args.attempt is None):
+        parser.error(f"{args.action} requires a Jira issue key and --attempt")
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     state = None
     try:
@@ -695,6 +703,15 @@ def main(argv=None):
             return open_blocked(Jira(), project=args.project, state_dir=args.state_dir, profile=args.profile,
                                 key=args.key, dry_run=args.dry_run)
         project_label(args.project)
+        if args.action == "watch":
+            directory = args.state_dir.expanduser().resolve() if args.state_dir else default_state_dir(args.project)
+            return watch_attempt(state_dir=directory, key=args.key, attempt=args.attempt,
+                                 full_output=args.full_output, follow=not args.dry_run)
+        if args.action == "resume":
+            directory = args.state_dir.expanduser().resolve() if args.state_dir else default_state_dir(args.project)
+            return resume_attempt(Jira(config.board_url) if config else Jira(), project=args.project,
+                                  state_dir=directory, key=args.key, attempt=args.attempt,
+                                  profile=args.profile, dry_run=args.dry_run)
         if config is None:
             if args.action == "status":
                 config = Workspace(args.project, args.state_dir.expanduser().resolve() if args.state_dir else default_state_dir(args.project),

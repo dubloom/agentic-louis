@@ -1,4 +1,5 @@
 import base64
+from copy import deepcopy
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 import json
@@ -8,6 +9,8 @@ import re
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
+
+from .comments import reference
 
 
 
@@ -95,7 +98,7 @@ def plain_text(value):
     if value.get("type") == "hardBreak":
         return "\n"
     text = "".join(plain_text(child) for child in value.get("content", []))
-    return text + ("\n" if value.get("type") in {"paragraph", "heading", "listItem"} else "")
+    return text + ("\n" if value.get("type") in {"paragraph", "heading", "listItem", "codeBlock"} else "")
 
 
 class ApiError(JiraError):
@@ -241,5 +244,6 @@ class Jira:
                 break
             if not comments:
                 raise ApiError("Jira comment pagination stopped early.")
-        self.request("POST", f"/rest/api/3/issue/{key}/comment",
-                     payload={"body": document(text + "\n\n" + token)})
+        body = deepcopy(text) if isinstance(text, dict) else document(text)
+        body["content"].append(reference(token))
+        self.request("POST", f"/rest/api/3/issue/{key}/comment", payload={"body": body})

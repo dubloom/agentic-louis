@@ -54,6 +54,32 @@ def ensure_stopped(run):
             raise ValueError("The previous agent is still running. Wait for the worker to stop it before intervening.")
 
 
+def resume_attempt(jira, *, project, state_dir, key, attempt, profile=None, dry_run=False):
+    """Resume a specific completed attempt without claiming or changing Jira work."""
+    key = key.upper()
+    current = jira.issue(key)
+    if not is_managed(current, project):
+        raise ValueError("This ticket is no longer managed by this project.")
+    run = jira.run(key)
+    session, cwd = session_for(run, project, state_dir, key)
+    if run.get("attempt") != attempt:
+        raise ValueError("This command refers to an older attempt. Use the latest Jira comment.")
+    ensure_stopped(run)
+    # The supervisor may have exited while the worker still validates or publishes.
+    # Ready tickets can be admitted again, so do not open them interactively.
+    if run.get("phase") not in {"blocked", "review"} or not (
+            Jira.is_blocked(current) or current["fields"]["status"]["id"] in jira.columns()["In Review"]):
+        raise ValueError("Wait for the worker to finish and the ticket to reach Blocked or In Review before resuming.")
+    if dry_run:
+        return 0
+    if not sys.stdin.isatty() or not sys.stdout.isatty():
+        raise ValueError("Opening Codex requires an interactive terminal.")
+    args = ["codex", "resume", session, "--cd", str(cwd), "--ask-for-approval", "on-request"]
+    if profile:
+        args.extend(["--profile", profile])
+    return subprocess.call(args, cwd=cwd, env=child_environment())
+
+
 def open_blocked(jira, *, project=None, state_dir=None, profile=None, key=None, dry_run=False):
     console = make_console()
     rows = []

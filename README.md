@@ -221,11 +221,32 @@ Each task gets native Git worktrees and a `dubloom/<ticket-key>` branch across t
 Retries reuse existing branches, including branches created with the previous prefix.
 
 Once Codex starts its conversation, the next worker poll adds a Jira comment with
-commands to open that attempt's exact conversation in Codex, either from your
-laptop over SSH or directly on the worker workspace. Each attempt gets one start
-comment, including retries. Use the worker's Codex account and `CODEX_HOME`.
-While the agent is running, inspect the conversation and wait for it to stop
-before submitting instructions in the resumed session.
+commands to watch that attempt's saved event log, either from your laptop over
+SSH or directly on the worker workspace. The `agentic-louis watch TICKET --attempt NUMBER`
+command shows agent messages, commands, file changes, and concise command output
+as they arrive, without opening a Codex client. Large command outputs show only
+their last eight lines (up to 1,600 characters); add `--full-output` for the full
+output. Add `--dry-run` to print the saved progress without following new events.
+Press Ctrl-C to stop watching; the agent keeps running. Watching also exits when
+the supervised agent process finishes. Each attempt gets one start comment,
+including retries. The raw `events.jsonl` remains available for diagnostics.
+
+The Blocked and In Review comments provide
+`agentic-louis --project PROJECT --state-dir PATH resume TICKET --attempt NUMBER`
+to open the saved Codex conversation after the worker finishes, when a saved
+conversation is available. This wrapper checks that the supervisor and Codex
+child have stopped, the worker has finished
+validation and publication, and the ticket is Blocked or In Review. It rejects
+commands from older attempts after a retry. Use the worker's Codex account and
+`CODEX_HOME`. Run local resume commands from the worker's launch directory so
+its `.env` is loaded; the SSH command does this automatically. Avoid direct
+`codex resume` while the worker is running, since another client can interrupt
+the active conversation. Existing Jira comments retain their original commands;
+these watch and guarded resume commands appear on new attempts.
+
+Worker comments use native Jira headings, code blocks for commands and diagnostics,
+and labeled branch and PR links. Automation references and detailed failure logs
+are collapsed so the outcome and next steps stay easy to scan.
 
 ### Optional overrides
 

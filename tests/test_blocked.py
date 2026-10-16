@@ -195,6 +195,62 @@ class BlockedTests(unittest.TestCase):
         self.assertIn("still running", " ".join(logs.output))
         self.launch.assert_not_called()
 
+    def test_resume_completed_attempt_without_discovery_or_mutations(self):
+        run, session, task = self.saved_run()
+        before = deepcopy(self.jira.issues)
+        self.launch.return_value = 7
+        with patch("agentic_louis.worker.Workspace.discover") as discover:
+            self.assertEqual(main(["--project", "trajectory", "resume", "LTRA-1", "--attempt", "1",
+                                   "--profile", "personal"]), 7)
+        discover.assert_not_called()
+        self.assertEqual(self.launch.call_args.args[0], ["codex", "resume", session, "--cd", str(task),
+                                                         "--ask-for-approval", "on-request", "--profile", "personal"])
+        self.assertEqual(self.jira.issues, before)
+
+    def test_resume_rejects_live_supervisor_child_or_fallback_pid(self):
+        run, _, _ = self.saved_run()
+        for name in ("supervisor.json", "child.json", None):
+            with self.subTest(process=name):
+                if name:
+                    path = Path(run["attempt_dir"]) / name
+                    atomic_json(path, {"token": run["launch_token"], "pid": 123, "identity": "live"})
+                else:
+                    self.jira.save_run("LTRA-1", {**run, "supervisor_pid": 123, "supervisor_identity": "live"})
+                with patch("agentic_louis.blocked.identity", return_value="live"), self.assertLogs(level="ERROR") as logs:
+                    self.assertEqual(main(["--project", "trajectory", "resume", "LTRA-1", "--attempt", "1"]), 1)
+                self.assertIn("still running", " ".join(logs.output))
+                if name:
+                    path.unlink()
+        self.launch.assert_not_called()
+
+    def test_resume_rejects_stale_attempt_and_unfinished_worker(self):
+        run, _, _ = self.saved_run()
+        for changes, attempt in (({}, "2"), ({"phase": "verifying"}, "1"), ({"phase": "running"}, "1")):
+            self.jira.save_run("LTRA-1", {**run, **changes})
+            with self.subTest(changes=changes, attempt=attempt), self.assertLogs(level="ERROR"):
+                self.assertEqual(main(["--project", "trajectory", "resume", "LTRA-1", "--attempt", attempt]), 1)
+        self.launch.assert_not_called()
+
+    def test_resume_allows_review_but_rejects_requeued_ticket(self):
+        run, _, _ = self.saved_run()
+        self.jira.save_run("LTRA-1", {**run, "phase": "review"})
+        self.jira.issues["LTRA-1"]["fields"]["status"] = {"id": "3", "name": "Custom review status"}
+        args = ["--project", "trajectory", "resume", "LTRA-1", "--attempt", "1"]
+        self.assertEqual(main(args), 0)
+        self.launch.reset_mock()
+        self.jira.issues["LTRA-1"]["fields"]["status"] = {"id": "6", "name": "Ready"}
+        with self.assertLogs(level="ERROR"):
+            self.assertEqual(main(args), 1)
+        self.launch.assert_not_called()
+
+    def test_resume_dry_run_and_noninteractive(self):
+        self.saved_run()
+        args = ["--project", "trajectory", "resume", "LTRA-1", "--attempt", "1"]
+        self.assertEqual(main([*args, "--dry-run"]), 0)
+        with patch("agentic_louis.blocked.sys.stdin.isatty", return_value=False), self.assertLogs(level="ERROR"):
+            self.assertEqual(main(args), 1)
+        self.launch.assert_not_called()
+
     def test_only_latest_attempt_is_used_and_incomplete_events_are_tolerated(self):
         old, old_session, task = self.saved_run()
         run, session, _ = self.saved_run(attempt=2)

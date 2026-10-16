@@ -66,7 +66,7 @@ class FakeJira:
     def comment_once(self, key, token, text):
         if self.comment_error:
             raise self.comment_error
-        self.comments.setdefault(token, (key, text))
+        self.comments.setdefault(token, (key, plain_text(text)))
 
 
 class FakeGitHub:
@@ -501,6 +501,7 @@ class WorkerTests(unittest.TestCase):
 
     def test_start_comment_waits_for_session_and_survives_restart(self):
         run, attempt = self.conversation_run()
+        self.worker.launch_directory = self.root / "launch 'directory' $(literal)"
         session = "12345678-1234-1234-1234-123456789abc"
         with patch("agentic_louis.worker.identity", return_value="start"):
             Worker.collect(self.worker, run)
@@ -508,10 +509,17 @@ class WorkerTests(unittest.TestCase):
             (attempt / "events.jsonl").write_text(json.dumps({"type": "thread.started", "thread_id": session}) + "\n")
             Worker.collect(self.worker, run)
         text = next(iter(self.jira.comments.values()))[1]
-        ssh = shlex.split(text.splitlines()[3])
+        commands = [shlex.split(line) for line in text.splitlines() if line.startswith("ssh ")]
+        self.assertEqual(len(commands), 1)
+        self.assertNotIn("resume", text.casefold())
+        self.assertEqual(shlex.split(commands[0][3]), ["agentic-louis", "--project", "trajectory",
+                                                     "--state-dir", str(self.root), "watch", "LTRA-1", "--attempt", "1"])
+        local, remote = self.worker.resume_commands(run)
+        ssh = shlex.split(remote)
         self.assertEqual(ssh[:3], ["ssh", "-t", "workspace-dubloom-trajectory"])
-        self.assertEqual(shlex.split(ssh[3]), ["codex", "resume", session, "--cd", str(attempt.parent),
-                                             "--ask-for-approval", "on-request", "--profile", "automation"])
+        self.assertEqual(shlex.split(ssh[3]), ["cd", str(self.worker.launch_directory), "&&",
+                                             "agentic-louis", "--project", "trajectory", "--state-dir", str(self.root),
+                                             "resume", "LTRA-1", "--attempt", "1", "--profile", "automation"])
         self.assertEqual(run["phase"], "running")
         restarted = Worker(self.config, self.jira, self.github, self.state, self.worker.webhook)
         with patch.object(self.jira, "comment_once", wraps=self.jira.comment_once) as comment:
@@ -530,6 +538,18 @@ class WorkerTests(unittest.TestCase):
         self.jira.comment_error = None
         self.worker.started_comment(run)
         self.assertEqual(run["started_commented"], 1)
+
+    def test_blocked_comment_has_guarded_resume_only_when_session_exists(self):
+        run, attempt = self.conversation_run()
+        (attempt / "events.jsonl").write_text(json.dumps({"type": "thread.started", "thread_id":
+                                                        "12345678-1234-1234-1234-123456789abc"}) + "\n")
+        run["error"] = "Tests failed"
+        self.worker.error_comment(run)
+        body = self.jira.comments["[agentic-louis:LTRA-1:blocked:1]"][1]
+        self.assertIn("resume LTRA-1 --attempt 1", body)
+        self.assertNotIn("tail -n", body)
+        (attempt / "events.jsonl").unlink()
+        self.assertIsNone(self.worker.resume_commands(run))
 
     def test_each_attempt_gets_its_own_conversation_comment(self):
         for number in (1, 2):
@@ -641,7 +661,7 @@ class GitVerificationTests(unittest.TestCase):
         comment = self.jira.comments["[agentic-louis:LTRA-1:blocked:1]"][1]
         self.assertIn("Tests failed: Docker unavailable", comment)
         for repo in (dirty, committed):
-            self.assertIn(f"https://github.com/{repo.github}/tree/{self.branch}", comment)
+            self.assertIn(f"{repo.github} · {self.branch}", comment)
         self.assertNotIn("DataDog/unchanged", comment)
         heads = [command(["git", "rev-parse", "HEAD"], cwd=p) for p in (dirty_path, committed_path)]
         worker.publish_partial_branches(self.run)
@@ -660,8 +680,8 @@ class GitVerificationTests(unittest.TestCase):
         worker.block_failure(self.run)
         comment = self.jira.comments["[agentic-louis:LTRA-1:blocked:1]"][1]
         self.assertIn("Could not publish partial work for broken", comment)
-        self.assertIn(f"https://github.com/{good.github}/tree/{self.branch}", comment)
-        self.assertNotIn(f"https://github.com/{broken.github}/tree/", comment)
+        self.assertIn(f"{good.github} · {self.branch}", comment)
+        self.assertNotIn(f"{broken.github} · {self.branch}", comment)
         self.assertEqual(command(["git", "show", "HEAD:feature.txt"], cwd=broken_path), "partial")
 
     def test_partial_publication_refuses_a_different_branch(self):
@@ -791,8 +811,12 @@ class GitVerificationTests(unittest.TestCase):
         self.assertEqual(self.jira.issue("LTRA-1")["fields"]["status"]["id"], "3")
         self.assertEqual(len(messages), 1)
         started = self.jira.comments["[agentic-louis:LTRA-1:started:1]"][1]
-        self.assertIn("codex resume 12345678-1234-1234-1234-123456789abc", started)
+        self.assertNotIn("resume", started.casefold())
+        self.assertIn("watch LTRA-1 --attempt 1", started)
         self.assertIn("ssh -t workspace-dubloom-trajectory", started)
+        review = self.jira.comments["[agentic-louis:LTRA-1:ready:1]"][1]
+        self.assertIn("resume LTRA-1 --attempt 1", review)
+        self.assertNotIn("tail -n", review)
         self.assertTrue((Path(run["attempt_dir"]) / "check-first-0.log").exists())
         setup_log = (Path(run["attempt_dir"]) / "setup-first-0.log").read_text()
         self.assertIn(str(path), setup_log)
