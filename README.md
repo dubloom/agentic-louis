@@ -189,10 +189,25 @@ After verification, it adds a Jira comment, moves the ticket to **In Review**, a
 | `jira_ticket_url` | Jira ticket URL. |
 | `blocked` | Boolean: `false` for review, `true` for failed work. |
 | `prs` | Newline-separated PRs for review notifications. Omitted for blocked notifications. |
+| `resume_command` | Command to open the blocked ticket's saved Codex session directly. Includes the project, state directory, and optional profile, with shell quoting. Omitted for review notifications. |
 
 It sends one review notification per completed attempt, even when the task produces several PRs.
 If work fails, the worker records the error in Jira, moves the ticket to **Blocked**, and sends `blocked: true` without PRs.
 The slot becomes available after Jira confirms Blocked.
+
+In Slack Workflow Builder, add a **Text** input named `resume_command` to the webhook trigger, then insert that variable into a code block in the blocked-message step. For example:
+
+```text
+🟠 Blocked · [project_label]
+[jira_ticket_name]
+
+Open ticket: [jira_ticket_url]
+
+Resume on the worker machine:
+[resume_command]
+```
+
+Replace the bracketed placeholders with Workflow Builder's variable chips. Format the command as code so it is easy to copy. The command targets that ticket without showing the picker and uses the worker's exact state directory, even when it differs from the default. Run it with the worker's Jira credentials and Codex account / `CODEX_HOME`.
 
 **Review comments, merging, ready status, and Jira completion remain manual.** Move a finished ticket out of In Review to release its slot.
 
@@ -217,6 +232,23 @@ Restart from the same repository folder to collect their results. Use the same o
 ### Retry a failed task
 
 Failed work moves to **Blocked** and releases its slot. The worker records the error in Jira and sends a blocked notification. Blocked tickets wait for manual intervention. Move a blocked ticket to **Ready** when it should be retried.
+
+To intervene, run this in an interactive terminal on the worker machine:
+
+```sh
+agentic-louis blocked
+```
+
+The command shows managed Blocked tickets across projects in an interactive list, with task titles and a blocker preview for the highlighted ticket. The layout adapts to narrow terminals.
+Use **↑/↓** to highlight a ticket, then **Enter** to open its latest Codex session in the original task workspace, including its repository worktrees and conversation history. Tickets without a saved session are disabled. Select **Cancel** or press **Ctrl+C** to exit.
+It works from any directory while the worker is running. It uses the same Jira credentials and `.env` loading as other commands; keep the worker's Codex account and `CODEX_HOME` so its sessions are available.
+
+Use `agentic-louis --project trajectory blocked` to filter by project, or `agentic-louis blocked LTRA-123` to open a specific ticket directly.
+If the worker uses a custom state directory, supply both `--project` and `--state-dir`.
+Add `--dry-run` to print a table of tickets without opening Codex. Redirected output has no colors.
+Tickets that failed before Codex started, or whose local artifacts are missing, show why their sessions are unavailable.
+
+Opening a session leaves the ticket Blocked. Resolve the blocker, exit Codex, then move the ticket to **Ready** for the worker to retry and verify the task.
 
 Both **To Do** and **Ready** queue work. The running worker starts another attempt when a slot is free, reusing its branch, worktrees, and existing PRs. Saved execution checkpoints never prevent these tickets from being queued again. Moving a ticket to Blocked stops implementation; moving it to In Review stops implementation and holds its review slot.
 

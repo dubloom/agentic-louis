@@ -1,6 +1,7 @@
 from copy import deepcopy
 import json
 import os
+import shlex
 from pathlib import Path
 import tempfile
 import unittest
@@ -183,6 +184,11 @@ class WorkerTests(unittest.TestCase):
         for payload in self.notifications:
             self.assertIs(payload["blocked"], True)
             self.assertNotIn("prs", payload)
+            key = payload["jira_ticket_url"].rsplit("/", 1)[1]
+            self.assertEqual(shlex.split(payload["resume_command"]), [
+                "agentic-louis", "--project", "trajectory", "--state-dir", str(self.root),
+                "blocked", key, "--profile", "automation",
+            ])
 
     def test_restart_and_interrupted_claim_never_launch_again(self):
         self.add(1, "2")
@@ -389,6 +395,7 @@ class WorkerTests(unittest.TestCase):
         self.worker.notify(run, blocked=True, resend=True)
         self.assertEqual(len(self.notifications), 1)
         self.assertNotIn("prs", self.notifications[0])
+        self.assertIn("LTRA-1", self.notifications[0]["resume_command"])
 
     def test_retry_cannot_exceed_project_capacity(self):
         self.completed("failed")

@@ -1,0 +1,115 @@
+"""Find blocked Jira work and resume its saved Codex session interactively."""
+
+import json
+from pathlib import Path
+import subprocess
+import sys
+import uuid
+
+from .config import default_state_dir
+from .jira import Jira
+from .process import child_environment, identity
+from .projects import PROJECTS, is_managed, project_label
+from .terminal import blocked_tickets, make_console, selection_prompt
+
+
+def session_for(run, project, state_dir, key):
+    if not run or run.get("project") != project or run.get("key") != key:
+        raise ValueError("No execution checkpoint for this project.")
+    if not run.get("attempt_dir"):
+        raise ValueError("No saved Codex attempt; the agent may have failed before starting.")
+    directory = state_dir / "runs" / run["key"]
+    attempt = Path(run["attempt_dir"]).resolve()
+    if attempt.parent != directory or not attempt.is_dir():
+        raise ValueError("Saved attempt is unavailable here. Run on the worker machine with its original --state-dir.")
+    launch = json.loads((attempt / "launch.json").read_text())
+    if launch.get("token") != run.get("launch_token") or Path(launch["cwd"]).resolve() != directory:
+        raise ValueError("Saved launch does not match this attempt.")
+    with (attempt / "events.jsonl").open() as events:
+        for line in events:
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue  # Interrupted runs can end with an incomplete event.
+            if isinstance(event, dict) and event.get("type") == "thread.started":
+                try:
+                    session = str(uuid.UUID(event["thread_id"]))
+                except (KeyError, ValueError, TypeError, AttributeError):
+                    raise ValueError("Saved Codex session ID is invalid.") from None
+                return session, directory
+    raise ValueError("No Codex session ID in this attempt's event log.")
+
+
+def ensure_stopped(run):
+    processes = [{"pid": run.get("supervisor_pid"), "identity": run.get("supervisor_identity")}]
+    for name in ("supervisor.json", "child.json"):
+        path = Path(run["attempt_dir"]) / name
+        if path.exists():
+            metadata = json.loads(path.read_text())
+            if metadata.get("token") != run.get("launch_token"):
+                raise ValueError("Saved process metadata does not match this attempt.")
+            processes.append(metadata)
+    for process in processes:
+        if process.get("pid") and process.get("identity") and identity(process["pid"]) == process["identity"]:
+            raise ValueError("The previous agent is still running. Wait for the worker to stop it before intervening.")
+
+
+def open_blocked(jira, *, project=None, state_dir=None, profile=None, key=None, dry_run=False):
+    console = make_console()
+    rows = []
+    for name in (project,) if project else PROJECTS:
+        directory = Path(state_dir).expanduser().resolve() if state_dir else default_state_dir(name)
+        for issue in jira.candidates(project_label(name), None):
+            if is_managed(issue, name) and Jira.is_blocked(issue):
+                rows.append((issue, name, directory))
+    rows.sort(key=lambda row: (row[1], int(row[0]["key"].rsplit("-", 1)[1])))
+    if key:
+        rows = [row for row in rows if row[0]["key"] == key.upper()]
+        if not rows:
+            raise ValueError(f"{key} is not a managed Blocked ticket in the selected projects.")
+    if not rows:
+        blocked_tickets(console, [])
+        return 0
+    tickets = []
+    for issue, name, directory in rows:
+        run = jira.run(issue["key"])
+        try:
+            session_for(run, name, directory, issue["key"])
+            detail = " ".join(str((run or {}).get("error", "")).split())
+            available = True
+        except (ValueError, OSError) as error:
+            detail = f"Session unavailable: {error}"
+            available = False
+        tickets.append((issue, name, detail, available))
+    if dry_run:
+        blocked_tickets(console, tickets)
+        return 0
+    if not sys.stdin.isatty() or not sys.stdout.isatty():
+        blocked_tickets(console, tickets)
+        raise ValueError("Opening Codex requires an interactive terminal. Use --dry-run to list blocked tickets.")
+    if key:
+        blocked_tickets(console, tickets)
+        selected = rows[0]
+    else:
+        try:
+            answer = selection_prompt(console, tickets)
+        except EOFError:
+            return 0
+        if not answer:
+            return 0
+        selected = next(row for row in rows if row[0]["key"] == answer)
+    issue, name, directory = selected
+    # Re-read after the picker: Jira may have changed while the user was choosing.
+    current = jira.issue(issue["key"])
+    if not is_managed(current, name) or not Jira.is_blocked(current):
+        raise ValueError("This ticket is no longer managed and Blocked. Refresh the list.")
+    run = jira.run(issue["key"])
+    session, cwd = session_for(run, name, directory, issue["key"])
+    ensure_stopped(run)
+    args = ["codex", "resume", session, "--cd", str(cwd), "--ask-for-approval", "on-request"]
+    if profile:
+        args.extend(["--profile", profile])
+    console.print(f"\n[bold cyan]Opening {issue['key']} in Codex…[/]")
+    console.print("After resolving the blocker, exit Codex and move the ticket to Ready.", style="dim")
+    console.print()
+    return subprocess.call(args, cwd=cwd, env=child_environment())

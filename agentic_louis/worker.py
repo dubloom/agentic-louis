@@ -4,6 +4,7 @@ import logging
 import os
 from pathlib import Path
 import re
+import shlex
 import signal
 import subprocess
 import sys
@@ -12,6 +13,7 @@ import uuid
 
 from dotenv import load_dotenv
 
+from .blocked import open_blocked
 from .config import Workspace, default_state_dir, github_repository
 from .github import GitHub
 from . import ROOT
@@ -523,7 +525,13 @@ class Worker:
             "jira_ticket_name": run["summary"], "project_label": project_label(self.config.project),
             "jira_ticket_url": f"{self.jira.site}/browse/{run['key']}", "blocked": blocked,
         }
-        if not blocked:
+        if blocked:
+            args = ["agentic-louis", "--project", self.config.project,
+                    "--state-dir", str(self.config.state_dir), "blocked", run["key"]]
+            if self.config.profile:
+                args.extend(["--profile", self.config.profile])
+            payload["resume_command"] = shlex.join(args)
+        else:
             payload["prs"] = "\n".join(pr["url"] for pr in run["result"]["prs"])
         try:
             self.notifier(self.webhook, payload)
@@ -569,16 +577,25 @@ class Worker:
 def main(argv=None):
     load_dotenv(Path.cwd() / ".env", override=False)
     parser = argparse.ArgumentParser(description="Run a project workspace queue with a five-ticket capacity limit.")
-    parser.add_argument("--project", required=True)
+    parser.add_argument("--project", help="Project to run; omit with blocked to list all projects.")
     parser.add_argument("--state-dir", type=Path, help="Override the persistent state directory.")
     parser.add_argument("--profile", help="Optional Codex profile name.")
-    parser.add_argument("action", nargs="?", choices=("run", "status", "retry", "resend", "check"), default="run")
+    parser.add_argument("action", nargs="?", choices=("run", "status", "blocked", "retry", "resend", "check"), default="run")
     parser.add_argument("key", nargs="?")
     parser.add_argument("--dry-run", action="store_true", help="Check prerequisites and show matching tasks without mutations.")
     args = parser.parse_args(argv)
+    if not args.project and args.action != "blocked":
+        parser.error("--project is required for this action")
+    if args.action == "blocked" and args.state_dir and not args.project:
+        parser.error("--state-dir requires --project with blocked")
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     state = None
     try:
+        if args.action == "blocked":
+            if args.project:
+                project_label(args.project)
+            return open_blocked(Jira(), project=args.project, state_dir=args.state_dir, profile=args.profile,
+                                key=args.key, dry_run=args.dry_run)
         project_label(args.project)
         if args.action == "status":
             config = Workspace(args.project, args.state_dir.expanduser().resolve() if args.state_dir else default_state_dir(args.project),
