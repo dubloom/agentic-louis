@@ -1,4 +1,5 @@
 from copy import deepcopy
+from dataclasses import replace
 import json
 import os
 import shlex
@@ -185,10 +186,61 @@ class WorkerTests(unittest.TestCase):
             self.assertIs(payload["blocked"], True)
             self.assertNotIn("prs", payload)
             key = payload["jira_ticket_url"].rsplit("/", 1)[1]
-            self.assertEqual(shlex.split(payload["resume_command"]), [
+            ssh = shlex.split(payload["resume_command"])
+            self.assertEqual(ssh[:3], ["ssh", "-t", "workspace-dubloom-trajectory"])
+            directory, remote_command = ssh[3].split(" && ", 1)
+            self.assertEqual(shlex.split(directory), ["cd", str(self.worker.launch_directory)])
+            self.assertEqual(shlex.split(remote_command), [
                 "agentic-louis", "--project", "trajectory", "--state-dir", str(self.root),
                 "blocked", key, "--profile", "automation",
             ])
+
+    def test_blocked_notification_cursor_targets_ticket_worktrees_and_remote(self):
+        self.add(1, "5")
+        self.worker.config = replace(self.config, state_dir=self.root / "state with spaces")
+        path = self.worker.config.state_dir / "runs" / "LTRA-1" / "repositories"
+        path.mkdir(parents=True)
+        run = {"key": "LTRA-1", "summary": "Blocked task", "attempt": 1}
+        self.worker.notify(run, blocked=True)
+        self.assertEqual(shlex.split(self.notifications[-1]["cursor_command"]),
+                         ["cursor", "--remote", "ssh-remote+workspace-dubloom-trajectory", str(path)])
+        self.worker.config = replace(self.worker.config, cursor_remote="ssh-remote+workspace")
+        self.worker.notify(run, blocked=True, resend=True)
+        self.assertEqual(shlex.split(self.notifications[-1]["cursor_command"]),
+                         ["cursor", "--remote", "ssh-remote+workspace", str(path)])
+        self.assertIn("blocked LTRA-1", self.notifications[-1]["resume_command"])
+        missing = {"key": "LTRA-2", "summary": "Failed before setup", "attempt": 1}
+        self.jira.issues["LTRA-2"] = issue("LTRA-2", "5")
+        self.worker.notify(missing, blocked=True)
+        self.assertEqual(self.notifications[-1]["cursor_command"], "")
+
+    def test_resume_command_runs_on_project_workspace_with_remote_paths_quoted(self):
+        self.add(1, "5", project="dd-trace-py")
+        self.worker.config = replace(self.config, project="dd-trace-py", profile=None,
+                                     state_dir=self.root / "state with 'quotes'")
+        self.worker.launch_directory = self.root / "launch with 'quotes'"
+        run = {"key": "LTRA-1", "summary": "Blocked task", "attempt": 1}
+        self.worker.notify(run, blocked=True)
+        ssh = shlex.split(self.notifications[-1]["resume_command"])
+        self.assertEqual(ssh[:3], ["ssh", "-t", "workspace-dubloom-dd-trace-py"])
+        self.assertEqual(shlex.split(ssh[3]), [
+            "cd", str(self.worker.launch_directory), "&&", "agentic-louis", "--project", "dd-trace-py",
+            "--state-dir", str(self.worker.config.state_dir), "blocked", "LTRA-1",
+        ])
+
+    def test_agent_focus_paths_use_ticket_worktrees(self):
+        focused = Repository("backend", self.root / "original-backend", "DataDog/backend", "main", (), folder="src/api")
+        whole = Repository("frontend", self.root / "original-frontend", "DataDog/frontend", "main", ())
+        self.worker.config = replace(self.config, repositories=(focused, whole))
+        paths = {repo.name: {"path": str(self.root / "runs" / "LTRA-1" / "repositories" / repo.name)}
+                 for repo in (focused, whole)}
+        run = {"branch": "dubloom/ltra-1", "key": "LTRA-1", "repositories": paths}
+        prompt = self.worker.prompt(run, issue("LTRA-1"))
+        repos = json.loads(prompt.split("Repositories: ", 1)[1].split("\nPrevious error:", 1)[0])
+        self.assertEqual(repos[0]["focus_path"], str(Path(paths["backend"]["path"]) / "src/api"))
+        self.assertEqual(repos[1]["focus_path"], paths["frontend"]["path"])
+        self.assertIn("Read repository-level instructions", prompt)
+        self.assertNotIn(str(focused.path), prompt)
 
     def test_restart_and_interrupted_claim_never_launch_again(self):
         self.add(1, "2")
@@ -435,6 +487,61 @@ class WorkerTests(unittest.TestCase):
         Worker.collect(self.worker, run)
         self.assertEqual(run["phase"], "verifying")
 
+    def conversation_run(self, attempt=1):
+        self.add(1, "2")
+        directory = self.root / "runs" / "LTRA-1"
+        attempt_dir = directory / f"attempt-{attempt}"
+        attempt_dir.mkdir(parents=True, exist_ok=True)
+        run = {"key": "LTRA-1", "phase": "running", "attempt": attempt,
+               "attempt_dir": str(attempt_dir), "launch_token": "token"}
+        self.state.save(run)
+        atomic_json(attempt_dir / "launch.json", {"token": "token", "cwd": str(directory)})
+        atomic_json(attempt_dir / "supervisor.json", {"token": "token", "pid": 123, "identity": "start"})
+        return run, attempt_dir
+
+    def test_start_comment_waits_for_session_and_survives_restart(self):
+        run, attempt = self.conversation_run()
+        session = "12345678-1234-1234-1234-123456789abc"
+        with patch("agentic_louis.worker.identity", return_value="start"):
+            Worker.collect(self.worker, run)
+            self.assertEqual(self.jira.comments, {})
+            (attempt / "events.jsonl").write_text(json.dumps({"type": "thread.started", "thread_id": session}) + "\n")
+            Worker.collect(self.worker, run)
+        text = next(iter(self.jira.comments.values()))[1]
+        ssh = shlex.split(text.splitlines()[3])
+        self.assertEqual(ssh[:3], ["ssh", "-t", "workspace-dubloom-trajectory"])
+        self.assertEqual(shlex.split(ssh[3]), ["codex", "resume", session, "--cd", str(attempt.parent),
+                                             "--ask-for-approval", "on-request", "--profile", "automation"])
+        self.assertEqual(run["phase"], "running")
+        restarted = Worker(self.config, self.jira, self.github, self.state, self.worker.webhook)
+        with patch.object(self.jira, "comment_once", wraps=self.jira.comment_once) as comment:
+            restarted.started_comment(self.state.get("LTRA-1"))
+            comment.assert_not_called()
+
+    def test_start_comment_retries_jira_error_without_stopping_agent(self):
+        run, attempt = self.conversation_run()
+        (attempt / "events.jsonl").write_text(json.dumps({"type": "thread.started", "thread_id":
+                                                        "12345678-1234-1234-1234-123456789abc"}) + "\n")
+        self.jira.comment_error = ApiError("Unavailable", retryable=True)
+        with self.assertRaises(ApiError), patch.object(self.worker, "stop") as stop:
+            Worker.collect(self.worker, run)
+        stop.assert_not_called()
+        self.assertNotIn("started_commented", self.state.get("LTRA-1"))
+        self.jira.comment_error = None
+        self.worker.started_comment(run)
+        self.assertEqual(run["started_commented"], 1)
+
+    def test_each_attempt_gets_its_own_conversation_comment(self):
+        for number in (1, 2):
+            run, attempt = self.conversation_run(number)
+            (attempt / "events.jsonl").write_text(json.dumps({"type": "thread.started", "thread_id":
+                                                            f"12345678-1234-1234-1234-{number:012d}"}) + "\n")
+            self.worker.started_comment(run)
+            # Reconcile an uncertain Jira write before its checkpoint was saved.
+            run.pop("started_commented")
+            self.worker.started_comment(run)
+        self.assertEqual(len(self.jira.comments), 2)
+
     def test_live_supervisor_is_not_duplicated_after_restart(self):
         run = self.completed("running")
         run.update(attempt_dir=str(self.root / "attempt"), launch_token="token")
@@ -510,6 +617,79 @@ class GitVerificationTests(unittest.TestCase):
         self.worker().verify(self.run)
         self.assertEqual(len(self.run["verified_checks"]), 2)
 
+    def test_failed_agent_saves_dirty_and_unpushed_repositories_to_ticket(self):
+        dirty, dirty_path = self.repository("dirty")
+        committed, committed_path = self.repository("committed")
+        unchanged, unchanged_path = self.repository("unchanged")
+        (dirty_path / "feature.txt").write_text("partial changes\n")
+        (dirty_path / "new.txt").write_text("new file\n")
+        (committed_path / "feature.txt").unlink()
+        command(["git", "add", "--all"], cwd=committed_path)
+        command(["git", "commit", "-m", "Partial implementation"], cwd=committed_path)
+        self.run.update(attempt=1, launch_token="token")
+        worker = self.worker()
+        worker.notifier = lambda *args: None
+        worker.fail(self.run, "Tests failed: Docker unavailable")
+        worker.block_failure(self.run)
+        self.assertTrue(Jira.is_blocked(self.jira.issue("LTRA-1")))
+        for repo, path in ((dirty, dirty_path), (committed, committed_path)):
+            head = command(["git", "rev-parse", "HEAD"], cwd=path)
+            remote = command(["git", "ls-remote", "origin", f"refs/heads/{self.branch}"], cwd=path)
+            self.assertEqual(remote.split()[0], head)
+            self.assertEqual(command(["git", "status", "--porcelain"], cwd=path), "")
+        self.assertEqual(command(["git", "ls-remote", "origin", f"refs/heads/{self.branch}"], cwd=unchanged_path), "")
+        comment = self.jira.comments["[agentic-louis:LTRA-1:blocked:1]"][1]
+        self.assertIn("Tests failed: Docker unavailable", comment)
+        for repo in (dirty, committed):
+            self.assertIn(f"https://github.com/{repo.github}/tree/{self.branch}", comment)
+        self.assertNotIn("DataDog/unchanged", comment)
+        heads = [command(["git", "rev-parse", "HEAD"], cwd=p) for p in (dirty_path, committed_path)]
+        worker.publish_partial_branches(self.run)
+        self.assertEqual(heads, [command(["git", "rev-parse", "HEAD"], cwd=p) for p in (dirty_path, committed_path)])
+
+    def test_push_failure_is_reported_and_other_repositories_are_saved(self):
+        broken, broken_path = self.repository("broken")
+        good, good_path = self.repository("good")
+        for path in (broken_path, good_path):
+            (path / "feature.txt").write_text("partial\n")
+        command(["git", "remote", "set-url", "origin", str(self.root / "missing.git")], cwd=broken_path)
+        self.run.update(attempt=1, launch_token="token")
+        worker = self.worker()
+        worker.notifier = lambda *args: None
+        worker.fail(self.run, "Agent crashed")
+        worker.block_failure(self.run)
+        comment = self.jira.comments["[agentic-louis:LTRA-1:blocked:1]"][1]
+        self.assertIn("Could not publish partial work for broken", comment)
+        self.assertIn(f"https://github.com/{good.github}/tree/{self.branch}", comment)
+        self.assertNotIn(f"https://github.com/{broken.github}/tree/", comment)
+        self.assertEqual(command(["git", "show", "HEAD:feature.txt"], cwd=broken_path), "partial")
+
+    def test_partial_publication_refuses_a_different_branch(self):
+        repo, path = self.repository("first")
+        command(["git", "checkout", "-b", "unrelated"], cwd=path)
+        (path / "feature.txt").write_text("partial\n")
+        self.run.update(attempt=1, launch_token="token")
+        self.worker().publish_partial_branches(self.run)
+        self.assertIn("Unexpected worktree branch", self.run["branch_publication_errors"][0])
+        self.assertEqual(self.run["partial_branches"], [])
+        self.assertNotEqual(command(["git", "status", "--porcelain"], cwd=path), "")
+
+    def test_partial_publication_does_not_overwrite_remote_changes(self):
+        repo, path = self.repository("first")
+        command(["git", "checkout", "-b", "remote-work"], cwd=repo.path)
+        (repo.path / "feature.txt").write_text("someone else's work\n")
+        command(["git", "commit", "-am", "Remote work"], cwd=repo.path)
+        command(["git", "push", "origin", f"HEAD:refs/heads/{self.branch}"], cwd=repo.path)
+        remote_head = command(["git", "rev-parse", "HEAD"], cwd=repo.path)
+        (path / "feature.txt").write_text("agent work\n")
+        self.run.update(attempt=1, launch_token="token")
+        self.worker().publish_partial_branches(self.run)
+        remote = command(["git", "ls-remote", "origin", f"refs/heads/{self.branch}"], cwd=path)
+        self.assertEqual(remote.split()[0], remote_head)
+        self.assertEqual(self.run["partial_branches"], [])
+        self.assertTrue(self.run["branch_publication_errors"])
+        self.assertEqual(command(["git", "show", "HEAD:feature.txt"], cwd=path), "agent work")
+
     def test_missing_pr_for_one_changed_repository(self):
         for name in ("first", "second"):
             repo, path = self.repository(name)
@@ -571,6 +751,8 @@ class GitVerificationTests(unittest.TestCase):
         except ImportError:
             import tomli as tomllib
         repo, original_worktree = self.repository("first", (("git", "diff", "--exit-code"),))
+        repo = replace(repo, setup=((sys.executable, "-c", "from pathlib import Path; print(Path.cwd()); print('setup complete')"),))
+        self.repos[0] = repo
         command(["git", "worktree", "remove", str(original_worktree)], cwd=repo.path)
         command(["git", "branch", "-D", self.branch], cwd=repo.path)
         binary_dir = self.root / "bin"
@@ -587,6 +769,7 @@ class GitVerificationTests(unittest.TestCase):
             worker.children["LTRA-1"].wait(timeout=15)
         self.assertEqual(run["branch"], "dubloom/ltra-1")
         launch = json.loads((Path(run["attempt_dir"]) / "launch.json").read_text())
+        self.assertEqual(launch["args"][launch["args"].index("--model") + 1], "gpt-6.1-sol")
         override = next(a for a in launch["args"] if a.startswith("permissions.agentic-task.filesystem="))
         permission = tomllib.loads(override)["permissions"]["agentic-task"]["filesystem"]
         common = command(["git", "rev-parse", "--path-format=absolute", "--git-common-dir"], cwd=repo.path)
@@ -607,7 +790,42 @@ class GitVerificationTests(unittest.TestCase):
         self.assertEqual(self.state.get("LTRA-1")["phase"], "review")
         self.assertEqual(self.jira.issue("LTRA-1")["fields"]["status"]["id"], "3")
         self.assertEqual(len(messages), 1)
+        started = self.jira.comments["[agentic-louis:LTRA-1:started:1]"][1]
+        self.assertIn("codex resume 12345678-1234-1234-1234-123456789abc", started)
+        self.assertIn("ssh -t workspace-dubloom-trajectory", started)
         self.assertTrue((Path(run["attempt_dir"]) / "check-first-0.log").exists())
+        setup_log = (Path(run["attempt_dir"]) / "setup-first-0.log").read_text()
+        self.assertIn(str(path), setup_log)
+        self.assertIn("setup complete", setup_log)
+
+    def test_setup_failure_blocks_without_starting_codex(self):
+        import sys
+        repo, worktree = self.repository("first")
+        command(["git", "worktree", "remove", str(worktree)], cwd=repo.path)
+        command(["git", "branch", "-D", self.branch], cwd=repo.path)
+        self.repos[0] = replace(repo, setup=((sys.executable, "-c", "raise SystemExit('setup failed')"),))
+        self.jira.issues["LTRA-1"] = issue("LTRA-1")
+        worker = self.worker()
+        worker.notifier = lambda *args: None
+        worker.tick()
+        self.assertEqual(worker.children, {})
+        self.assertFalse((Path(self.state.get("LTRA-1")["attempt_dir"]) / "launch.json").exists())
+        self.assertEqual(self.jira.issue("LTRA-1")["fields"]["status"]["name"], "Blocked")
+        self.assertIn("setup failed", self.state.get("LTRA-1")["error"])
+
+    def test_focus_folder_missing_from_worktree_blocks_before_launch(self):
+        repo, worktree = self.repository("first")
+        (repo.path / "untracked-folder").mkdir()
+        command(["git", "worktree", "remove", str(worktree)], cwd=repo.path)
+        command(["git", "branch", "-D", self.branch], cwd=repo.path)
+        self.repos[0] = replace(repo, folder="untracked-folder")
+        self.jira.issues["LTRA-1"] = issue("LTRA-1")
+        worker = self.worker()
+        worker.notifier = lambda *args: None
+        worker.tick()
+        self.assertEqual(worker.children, {})
+        self.assertEqual(self.jira.issue("LTRA-1")["fields"]["status"]["name"], "Blocked")
+        self.assertIn("Configured folder is unavailable", self.state.get("LTRA-1")["error"])
 
 
 class SharedTests(unittest.TestCase):
@@ -637,6 +855,7 @@ from pathlib import Path
 import subprocess
 import sys
 prompt = sys.stdin.read()
+print(json.dumps({"type": "thread.started", "thread_id": "12345678-1234-1234-1234-123456789abc"}), flush=True)
 repositories = json.loads(next(line.removeprefix("Repositories: ") for line in prompt.splitlines() if line.startswith("Repositories: ")))
 branch = next(line.removeprefix("Branch: ") for line in prompt.splitlines() if line.startswith("Branch: "))
 prs = []

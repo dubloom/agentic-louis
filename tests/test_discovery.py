@@ -55,6 +55,104 @@ class DiscoveryTests(unittest.TestCase):
             config = Workspace.discover(path, "dd-trace-py", state_dir=self.root / "state")
         self.assertEqual([r.path for r in config.repositories], [path])
 
+    def test_explicit_group_resolves_paths_and_commands_beside_config(self):
+        backend = self.repository("backend")
+        self.repository("unrelated")
+        path = self.root / "workspace.json"
+        (backend / "src").mkdir()
+        path.write_text(json.dumps({
+            "project": "trajectory", "state_dir": "saved state", "profile": "automation",
+            "cursor_remote": "ssh-remote+workspace-my-workspace",
+            "repositories": [{"path": "backend", "folder": "src", "base": "release",
+                              "setup": [["python", "-m", "pip", "install", "-e", "."]],
+                              "checks": [["python", "-m", "unittest"]]}],
+        }))
+        with patch("agentic_louis.config.command", side_effect=self.git):
+            config = Workspace.load(path)
+        self.assertEqual([r.path for r in config.repositories], [backend])
+        self.assertEqual(config.repositories[0].base, "release")
+        self.assertEqual(config.repositories[0].checks, (("python", "-m", "unittest"),))
+        self.assertEqual(config.repositories[0].setup, (("python", "-m", "pip", "install", "-e", "."),))
+        self.assertEqual(config.state_dir, self.root / "saved state")
+        self.assertEqual(config.cursor_remote, "ssh-remote+workspace-my-workspace")
+        self.assertEqual(config.repositories[0].folder, "src")
+        with patch("agentic_louis.config.command", side_effect=self.git):
+            overridden = Workspace.load(path, "trajectory", state_dir=self.root / "override", profile="personal")
+        self.assertEqual(overridden.state_dir, self.root / "override")
+        self.assertEqual(overridden.profile, "personal")
+
+    def test_configuration_rejects_conflicts_typos_and_invalid_commands(self):
+        self.repository("backend")
+        path = self.root / "workspace.json"
+        invalid = [
+            ({"project": "trajectory", "repositories": []}, "at least one"),
+            ({"project": "trajectory", "repositores": []}, "Unknown workspace"),
+            ({"project": "trajectory", "repositories": [{"path": "backend", "checks": ["pytest"]}]}, "argument arrays"),
+            ({"project": "trajectory", "repositories": [{"path": "backend", "setup": [[]]}]}, "argument arrays"),
+            ({"project": "trajectory", "repositories": [{"path": "backend", "check": []}]}, "Repository entries"),
+            ({"project": "trajectory", "repositories": [{"path": "backend"}, {"path": "./backend"}]}, "duplicate"),
+            ([], "JSON object"),
+        ]
+        for contents, error in invalid:
+            path.write_text(json.dumps(contents))
+            with self.subTest(contents=contents), patch("agentic_louis.config.command", side_effect=self.git):
+                with self.assertRaisesRegex(ValueError, error):
+                    Workspace.load(path)
+        path.write_text(json.dumps({"project": "trajectory", "repositories": [{"path": "backend"}]}))
+        with self.assertRaisesRegex(ValueError, "conflicts"):
+            Workspace.load(path, "dd-trace-py")
+
+    def test_cli_auto_configuration_dry_run_does_not_run_setup_or_claim(self):
+        self.repository("backend")
+        (self.root / "agentic-louis.json").write_text(json.dumps({
+            "project": "trajectory", "repositories": [{"path": "backend",
+                "setup": [["touch", "should-not-exist"]], "checks": [["pytest"]]}],
+        }))
+        jira = FakeJira()
+        with patch("pathlib.Path.cwd", return_value=self.root), \
+                patch("agentic_louis.config.command", side_effect=self.git), \
+                patch("agentic_louis.worker.Jira", return_value=jira), \
+                patch("agentic_louis.worker.Worker.preflight"), \
+                patch("agentic_louis.worker.State") as state, redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(main(["--dry-run"]), 0)
+        result = json.loads(output.getvalue())
+        self.assertEqual(result["repositories"][0]["checks"], [["pytest"]])
+        self.assertFalse((self.root / "backend" / "should-not-exist").exists())
+        self.assertEqual(jira.transitions, [])
+        state.assert_not_called()
+        # An explicit file selects the same repositories from another directory.
+        elsewhere = self.root / "elsewhere"
+        elsewhere.mkdir()
+        with patch("pathlib.Path.cwd", return_value=elsewhere), \
+                patch("agentic_louis.config.command", side_effect=self.git), \
+                patch("agentic_louis.worker.Jira", return_value=jira), \
+                patch("agentic_louis.worker.Worker.preflight"), redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(main(["--config", str(self.root / "agentic-louis.json"), "--dry-run"]), 0)
+        self.assertEqual(json.loads(output.getvalue())["repositories"], result["repositories"])
+
+    def test_minimal_json_needs_only_repository_paths_with_project_from_cli(self):
+        backend = self.repository("backend")
+        frontend = self.repository("frontend")
+        path = self.root / "workspace.json"
+        path.write_text(json.dumps({"repositories": [{"path": "backend"}, {"path": str(frontend)}]}))
+        with patch("agentic_louis.config.command", side_effect=self.git):
+            config = Workspace.load(path, "trajectory")
+        self.assertEqual([r.path for r in config.repositories], [backend, frontend])
+        self.assertTrue(all(r.folder is None for r in config.repositories))
+
+    def test_folder_must_exist_inside_repository(self):
+        backend = self.repository("backend")
+        (backend / "src").mkdir()
+        (backend / "escape").symlink_to(self.root, target_is_directory=True)
+        path = self.root / "workspace.json"
+        for folder in ("missing", "../", str(backend / "src"), "escape", "", [], 42):
+            path.write_text(json.dumps({"repositories": [{"path": "backend", "folder": folder}]}))
+            with self.subTest(folder=folder), self.assertRaisesRegex(ValueError, "folder must"):
+                Workspace.load(path, "trajectory")
+        path.write_text('{"repositories":')
+        with self.assertRaises(ValueError):
+            Workspace.load(path, "trajectory")
+
     def test_no_repositories_fails_before_polling(self):
         with self.assertRaisesRegex(ValueError, "No Git repositories"):
             Workspace.discover(self.root, "trajectory")

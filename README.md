@@ -121,14 +121,77 @@ It never resets a queued ticket to To Do.
 
 ### Run from the repository folder
 
-Run one worker per project. No workspace file is required.
+Run one worker per project. You can explicitly configure its repository group or use directory discovery.
+
+### Configure a repository group
+
+Create `agentic-louis.json` where you launch the worker, or pass
+`--config /path/to/workspace.json`. The file only needs repository locations and,
+optionally, a folder to focus on. See [agentic-louis.example.json](agentic-louis.example.json).
+
+```json
+{
+  "repositories": [
+    {"path": "./backend", "folder": "src/api"},
+    {"path": "./frontend"}
+  ]
+}
+```
+
+Only listed repositories are included. `path` must identify an existing Git
+repository root with a GitHub origin. It can be absolute or relative to the JSON
+file. `folder`, when supplied, must be an existing directory relative to that
+repository; omit it to focus on the whole repository. Absolute folder paths and
+paths or symlinks escaping the repository are rejected.
+
+The AI receives the focus folder inside its isolated ticket worktree, rather than
+the original checkout. It starts investigating there and can consult repository
+instructions, supporting code, and tests elsewhere in the worktree as needed.
+The folder is a focus hint, not a filesystem access restriction. If it is missing
+from the worktree (for example, an untracked local directory), the ticket is
+blocked before Codex starts.
+
+```sh
+agentic-louis --project trajectory --config /path/to/workspace.json --dry-run
+agentic-louis --project trajectory --config /path/to/workspace.json
+```
+
+With `agentic-louis.json` in the current directory, `--config` can be omitted.
+Select the queue using `--project`; optionally set a top-level `"project"` in the
+JSON file instead. If both are supplied, they must agree. The existing project
+registry controls allowed project names.
+
+Additional settings are optional:
+
+- Top-level `state_dir` and `profile` set the artifact directory and Codex profile;
+  `--state-dir` and `--profile` override them. Relative state paths resolve beside
+  the JSON file.
+- Slack commands automatically target `workspace-dubloom-<project-name>`.
+  Optional top-level `cursor_remote` overrides the Cursor SSH authority if needed.
+- Per-repository `base` overrides the remote's default branch.
+- Per-repository `setup` and `checks` accept argument arrays such as
+  `"setup": [["npm", "ci"]]` and `"checks": [["npm", "test"]]`. No shell is used.
+  Setup runs in every repository worktree before Codex starts, including retries,
+  so it must be safe to repeat. Failures block the ticket; logs are saved with the
+  attempt. Codex runs configured checks before publishing, and the worker runs
+  them again for changed repositories before moving the ticket to In Review.
+
+Duplicate repositories and unknown settings are rejected. Dry runs display the
+selected repositories, focus folders, and commands without executing setup or checks.
+Automatic config discovery applies to run, check, retry, and resend; pass `--config`
+explicitly for status or blocked commands that should use the file. Credentials
+still come from exported variables or `.env` in the launch directory.
+
+### Discover repositories from the launch directory
+
+When no config file is selected, directory discovery works as before.
 
 If the current directory is a Git repository root, the worker uses that repository.
 Otherwise it discovers Git repository roots in immediate child directories.
 It ignores hidden directories, symlink directories, and repositories nested more deeply.
 All discovered repositories belong to the selected project workspace.
 
-For each repository, the worker reads the GitHub repository from `origin` and resolves its default branch from the remote HEAD.
+For each repository, the worker reads the GitHub repository from `origin` and resolves its base branch from the remote HEAD unless `base` is configured.
 It fails with an error if either value cannot be resolved.
 Codex chooses validation from each repository's `AGENTS.md` and build or test configuration.
 
@@ -157,10 +220,18 @@ It polls every five seconds and uses a two-hour run timeout.
 Each task gets native Git worktrees and a `dubloom/<ticket-key>` branch across the discovered repositories.
 Retries reuse existing branches, including branches created with the previous prefix.
 
+Once Codex starts its conversation, the next worker poll adds a Jira comment with
+commands to open that attempt's exact conversation in Codex, either from your
+laptop over SSH or directly on the worker workspace. Each attempt gets one start
+comment, including retries. Use the worker's Codex account and `CODEX_HOME`.
+While the agent is running, inspect the conversation and wait for it to stop
+before submitting instructions in the resumed session.
+
 ### Optional overrides
 
 Use `--state-dir /path/to/state` to override the default state directory.
-Use `--profile NAME` to load `$CODEX_HOME/NAME.config.toml` if you want a specific model or additional Codex settings.
+New agent runs explicitly use `gpt-6.1-sol`, overriding any model set in a profile.
+Use `--profile NAME` to load `$CODEX_HOME/NAME.config.toml` for additional Codex settings.
 Without `--profile`, no worker profile file is needed.
 The worker skips the base Codex configuration and applies task permissions itself.
 It grants Git metadata writes for discovered repositories so Codex can commit changes.
@@ -172,7 +243,14 @@ Keep legacy `sandbox_mode` and `sandbox_workspace_write` settings out of an opti
 
 Codex reads the task and repository instructions, implements the change, runs checks, and publishes draft PRs.
 
-Agent instructions require all necessary tests and validation to pass across changed repositories before opening any PR. Failed, skipped, or unexecuted checks (including tests that cannot start because Docker is unavailable) must produce a failed result without creating or reopening a PR or updating an existing PR. The worker moves failed work to Blocked.
+Agent instructions require all necessary tests and validation to pass across changed repositories before opening any PR. If checks fail, are skipped, or cannot run (including when Docker is unavailable), the agent commits and pushes any code changes to the task branch and returns a failed result without creating or reopening a PR or editing PR metadata. The worker moves failed work to Blocked.
+
+On failure, the worker also stops the agent and saves any remaining uncommitted or
+unpushed changes to the task branch in each changed repository. This also covers
+agent crashes, timeouts, and worker verification failures. The Jira failure comment
+includes links to the published branches alongside the failure reason. Unchanged
+repositories are skipped. If a commit or push fails, the comment reports the error
+and local changes remain available for recovery. Pushes never force remote history.
 
 Before handing off, the worker:
 
@@ -189,13 +267,17 @@ After verification, it adds a Jira comment, moves the ticket to **In Review**, a
 | `jira_ticket_url` | Jira ticket URL. |
 | `blocked` | Boolean: `false` for review, `true` for failed work. |
 | `prs` | Newline-separated PRs for review notifications. Omitted for blocked notifications. |
-| `resume_command` | Command to open the blocked ticket's saved Codex session directly. Includes the project, state directory, and optional profile, with shell quoting. Omitted for review notifications. |
+| `resume_command` | Run on your laptop: SSH into `workspace-dubloom-<project-name>` with a terminal and resume the blocked ticket's saved Codex conversation. Preserves the worker's launch directory, state directory, and optional profile. Omitted for review notifications. |
+| `cursor_command` | Run on your laptop: open the blocked ticket's worktrees in Cursor over Remote SSH. Defaults to `workspace-dubloom-<project-name>`; `cursor_remote` can override Cursor's authority. Empty if worktrees were never created; omitted for review notifications. |
 
 It sends one review notification per completed attempt, even when the task produces several PRs.
 If work fails, the worker records the error in Jira, moves the ticket to **Blocked**, and sends `blocked: true` without PRs.
 The slot becomes available after Jira confirms Blocked.
 
-In Slack Workflow Builder, add a **Text** input named `resume_command` to the webhook trigger, then insert that variable into a code block in the blocked-message step. For example:
+In Slack Workflow Builder, add **Text** inputs named `resume_command` and
+`cursor_command` to the webhook trigger, then insert those variables into code
+blocks in the blocked-message step. This template update is required to display
+the commands; changing the worker alone does not change Slack's message. For example:
 
 ```text
 🟠 Blocked · [project_label]
@@ -203,11 +285,35 @@ In Slack Workflow Builder, add a **Text** input named `resume_command` to the we
 
 Open ticket: [jira_ticket_url]
 
-Resume on the worker machine:
+Open worktrees in Cursor from your laptop:
+[cursor_command]
+
+Resume Codex from your laptop:
 [resume_command]
 ```
 
-Replace the bracketed placeholders with Workflow Builder's variable chips. Format the command as code so it is easy to copy. The command targets that ticket without showing the picker and uses the worker's exact state directory, even when it differs from the default. Run it with the worker's Jira credentials and Codex account / `CODEX_HOME`.
+Replace the bracketed placeholders with Workflow Builder's variable chips. Format
+the commands as code so they are easy to copy. Both commands run on your laptop;
+they do not require a local installation of `agentic-louis` or Codex.
+
+For project `dd-trace-py` and ticket `LTRA-10`, the resume command has this form:
+
+```sh
+ssh -t workspace-dubloom-dd-trace-py 'cd /path/where/worker/was/launched && agentic-louis --project dd-trace-py --state-dir /home/bits/.local/state/agentic-louis/dd-trace-py blocked LTRA-10'
+```
+
+SSH allocates a terminal for Codex. The remote command restores the worker's
+launch directory so its `.env` credentials can be loaded, then resumes the exact
+saved conversation in its task directory. Keep the worker's Codex account and
+`CODEX_HOME` available on that workspace. Jira stays Blocked until you move it to Ready.
+
+The Cursor command opens `runs/<ticket>/repositories` under the remote state
+directory, which contains that ticket's worktrees across all its repositories.
+Your laptop needs Cursor's `cursor` command and Remote SSH access to the
+`workspace-dubloom-<project-name>` host alias. No Cursor executable is needed on
+the worker. These commands assume your laptop's workspace SSH configuration is set up.
+If setup failed before Codex started, worktrees can still be opened, but no Codex
+conversation exists yet; the resume command reports that condition.
 
 **Review comments, merging, ready status, and Jira completion remain manual.** Move a finished ticket out of In Review to release its slot.
 
@@ -224,6 +330,21 @@ agentic-louis --project trajectory status
 Git worktrees, process metadata, events, results, and validation logs live under the project artifact directory. Task tracking stays in Jira. **Keep this directory across restarts.**
 
 ### Restart the worker
+
+If startup reports `Another worker owns this artifact directory.`, an existing worker holds the project's `worker.lock`. On the worker machine, find its PID and inspect the process (this example uses the default state directory for `dd-trace-py`):
+
+```sh
+lsof /home/bits/.local/state/agentic-louis/dd-trace-py/worker.lock
+ps -p 12345 -o pid,ppid,lstart,args
+```
+
+Replace `12345` with the PID from `lsof`. After confirming it is the worker you want to stop, send Ctrl+C in its terminal or run:
+
+```sh
+kill -INT 12345
+```
+
+The lock releases when the worker exits. Do not delete `worker.lock` while a worker is running: doing so could allow two workers to use the same artifact directory. If you configured a different state directory, use its `worker.lock` path instead.
 
 Stopping the worker leaves existing supervisors running. Independent supervisors save Codex exit results even if the worker stops.
 

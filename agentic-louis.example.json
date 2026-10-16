@@ -1,0 +1,8 @@
+{
+  "repositories": [
+    {
+      "path": "../dd-trace-py",
+      "folder": "ddtrace"
+    }
+  ]
+}
