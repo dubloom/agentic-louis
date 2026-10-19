@@ -16,6 +16,7 @@ from dotenv import load_dotenv
 
 from .blocked import open_blocked, resume_attempt, session_for
 from . import comments
+from .clean import clean, record_worktree
 from .config import Workspace, default_state_dir, github_repository
 from .github import GitHub
 from . import ROOT
@@ -301,9 +302,11 @@ class Worker:
                     branches = command(["git", "for-each-ref", "--format=%(refname:short)", "refs/heads"], cwd=repo.path).splitlines()
                     if run["branch"] in branches:
                         command(["git", "worktree", "add", str(worktree), run["branch"]], cwd=repo.path)
+                        record_worktree(self.config.state_dir, repo.path, worktree, run["branch"], created_branch=False)
                     else:
                         worktree.parent.mkdir(parents=True, exist_ok=True)
                         command(["git", "worktree", "add", "-b", run["branch"], str(worktree), recorded["base_oid"]], cwd=repo.path)
+                        record_worktree(self.config.state_dir, repo.path, worktree, run["branch"])
                 branch = command(["git", "branch", "--show-current"], cwd=worktree)
                 if branch != run["branch"]:
                     raise ValueError(f"Worktree branch changed for {repo.name}.")
@@ -314,6 +317,7 @@ class Worker:
                 self.state.save(run)
                 worktree.parent.mkdir(parents=True, exist_ok=True)
                 command(["git", "worktree", "add", "-b", run["branch"], str(worktree), base_oid], cwd=repo.path)
+                record_worktree(self.config.state_dir, repo.path, worktree, run["branch"])
         # Prepare every worktree before starting an agent or publishing any PR.
         for repo in self.config.repositories:
             for index, args in enumerate(repo.setup):
@@ -683,22 +687,34 @@ class Worker:
 
 def main(argv=None):
     load_dotenv(Path.cwd() / ".env", override=False)
-    parser = argparse.ArgumentParser(description="Run a project workspace queue with a five-ticket capacity limit.")
-    parser.add_argument("--project", help="Project to run; defaults to the config file's project. Omit with blocked to list all projects.")
+    parser = argparse.ArgumentParser(description="Run a project workspace queue or watch PR checks and Codex reviews.")
+    parser.add_argument("--project", help="Project to run; defaults to the config file's project. Omit with blocked or clean for all projects.")
     parser.add_argument("--state-dir", type=Path, help="Override the persistent state directory.")
     parser.add_argument("--profile", help="Optional Codex profile name.")
     parser.add_argument("--config", type=Path, help="Workspace JSON file (default: ./agentic-louis.json when present).")
-    parser.add_argument("action", nargs="?", choices=("run", "status", "blocked", "resume", "retry", "resend", "check"), default="run")
-    parser.add_argument("key", nargs="?")
+    parser.add_argument("action", nargs="?", choices=("run", "watch-prs", "clean", "status", "blocked", "resume", "retry", "resend", "check"), default="run")
+    parser.add_argument("key", nargs="?", help="Jira issue key, or a GitHub PR URL with watch-prs.")
     parser.add_argument("--attempt", type=int, help="Saved attempt number required by resume.")
-    parser.add_argument("--dry-run", action="store_true", help="Check prerequisites and show matching tasks without mutations.")
+    parser.add_argument("--dry-run", action="store_true", help="Preview matching work or cleanup without mutations.")
+    parser.add_argument("--retry-blocked", action="store_true", help="With watch-prs, retry each blocked PR once even if feedback is unchanged.")
+    parser.add_argument("--pr", help="With watch-prs, watch only this GitHub PR URL in a configured or discovered repository.")
     args = parser.parse_args(argv)
+    if args.retry_blocked and args.action != "watch-prs":
+        parser.error("--retry-blocked requires watch-prs")
+    if args.pr and args.action != "watch-prs":
+        parser.error("--pr requires watch-prs")
+    if args.action == "watch-prs" and args.key:
+        if args.pr:
+            parser.error("Provide the PR URL either positionally or with --pr, not both")
+        args.pr = args.key
+    if args.action == "clean" and args.key:
+        parser.error("clean does not accept a Jira key or PR URL")
     config_path = args.config
     if config_path is None and args.action not in {"blocked", "status", "resume"}:
         candidate = Path.cwd() / "agentic-louis.json"
         if candidate.is_file():
             config_path = candidate
-    if not args.project and args.action != "blocked" and config_path is None:
+    if not args.project and args.action not in {"blocked", "clean"} and config_path is None:
         parser.error("--project is required for this action")
     if args.action == "blocked" and args.state_dir and not args.project and config_path is None:
         parser.error("--state-dir requires --project with blocked")
@@ -707,9 +723,15 @@ def main(argv=None):
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     state = None
     try:
-        config = Workspace.load(config_path, args.project, state_dir=args.state_dir, profile=args.profile) if config_path else None
+        load_options = {"resolve_base": False} if args.action == "clean" else {}
+        config = Workspace.load(config_path, args.project, state_dir=args.state_dir, profile=args.profile,
+                                **load_options) if config_path else None
         if config:
             args.project, args.state_dir, args.profile = config.project, config.state_dir, config.profile
+        if args.action == "clean":
+            if args.project:
+                project_label(args.project)
+            return clean(Path.cwd(), config=config, project=args.project, state_dir=args.state_dir, dry_run=args.dry_run)
         if args.action == "blocked":
             if args.project:
                 project_label(args.project)
@@ -727,6 +749,9 @@ def main(argv=None):
                                    args.profile, ())
             else:
                 config = Workspace.discover(Path.cwd(), args.project, state_dir=args.state_dir, profile=args.profile)
+        if args.action == "watch-prs":
+            from .watch_prs import PRWatcher
+            return PRWatcher(config, GitHub(), retry_blocked=args.retry_blocked, pr_url=args.pr).run(dry_run=args.dry_run)
         LOG.info("Project %s. State: %s", config.project, config.state_dir)
         for repo in config.repositories:
             LOG.info("Repository %s: %s, base %s", repo.name, repo.github, repo.base)

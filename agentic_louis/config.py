@@ -26,7 +26,7 @@ class Repository:
     name: str
     path: Path
     github: str
-    base: str
+    base: str | None
     checks: tuple
     setup: tuple = ()
     folder: str | None = None
@@ -44,7 +44,7 @@ class Workspace:
     cursor_remote: str | None = None
 
     @classmethod
-    def load(cls, path, project=None, *, state_dir=None, profile=None):
+    def load(cls, path, project=None, *, state_dir=None, profile=None, resolve_base=True):
         """Load an explicit repository allowlist; resolve paths beside the file."""
         path = Path(path).expanduser().resolve()
         data = json.loads(path.read_text())
@@ -86,7 +86,7 @@ class Workspace:
             repos.append(cls.repository(repo_path, base=base,
                                         checks=commands(entry.get("checks", []), "checks"),
                                         setup=commands(entry.get("setup", []), "setup"),
-                                        folder=entry.get("folder")))
+                                        folder=entry.get("folder"), resolve_base=resolve_base))
         cls.validate_repositories(repos)
         for field in ("profile", "cursor_remote"):
             if field in data and (not isinstance(data[field], str) or not data[field].strip()
@@ -98,7 +98,7 @@ class Workspace:
                    tuple(repos), cursor_remote=data.get("cursor_remote"))
 
     @staticmethod
-    def repository(path, *, base=None, checks=(), setup=(), folder=None):
+    def repository(path, *, base=None, checks=(), setup=(), folder=None, resolve_base=True):
         if folder is not None:
             if not isinstance(folder, str) or not folder.strip() or Path(folder).is_absolute():
                 raise ValueError("Repository folder must be a nonempty relative directory path.")
@@ -109,13 +109,14 @@ class Workspace:
         if Path(command(["git", "rev-parse", "--show-toplevel"], cwd=path)).resolve() != path:
             raise ValueError(f"Not a repository root: {path}")
         github = github_repository(command(["git", "remote", "get-url", "origin"], cwd=path))
-        if base is None:
+        if base is None and resolve_base:
             head = command(["git", "ls-remote", "--symref", "origin", "HEAD"], cwd=path)
             bases = re.findall(r"^ref: refs/heads/(.+)\s+HEAD$", head, flags=re.MULTILINE)
             if len(bases) != 1:
                 raise ValueError(f"Cannot determine the default branch for {path.name}. Check origin HEAD.")
             base = bases[0]
-        command(["git", "check-ref-format", "--branch", base])
+        if base is not None:
+            command(["git", "check-ref-format", "--branch", base])
         name = re.sub(r"[^A-Za-z0-9_-]", "-", path.name).strip("-_") or "repository"
         return Repository(name, path, github, base, checks, setup, folder)
 

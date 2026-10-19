@@ -14,6 +14,7 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from agentic_louis.process import atomic_json, child_environment, command, CommandError, identity
+from agentic_louis.ddtool import gitlab_project_token
 from agentic_louis.tmux import stop_terminal, terminal_args
 
 
@@ -39,7 +40,25 @@ def terminal(directory):
     # runtime stay in that group; --no-daemon prevents an unowned shared runtime.
     atomic_json(directory / "child.json", {"pid": os.getpid(), "identity": identity(os.getpid()),
                                            "token": launch["token"]})
-    exit_code = subprocess.call(launch["args"], cwd=launch["cwd"], env=child_environment())
+    # PR watchers must keep polling while potentially long setup commands run.
+    # Run setup inside the supervised terminal so timeout and orphan cleanup
+    # cover it, and do not start Codex if preparation fails.
+    try:
+        for index, args in enumerate(launch.get("setup", [])):
+            command(args, cwd=launch["setup_cwd"], timeout=launch["timeout"],
+                    log_path=directory / f"setup-{index}.log")
+        environment = child_environment()
+        if launch.get("gitlab_repository"):
+            owner, repository = launch["gitlab_repository"].split("/")
+            # This terminal launcher runs on the host, before Codex applies its
+            # sandbox. Keep credentials out of launch.json and process arguments.
+            environment["GITLAB_TOKEN"] = gitlab_project_token(owner, repository)
+            environment["GITLAB_HOST"] = "gitlab.ddbuild.io"
+            print(f"GitLab authentication ready for {owner}/{repository}.", flush=True)
+    except (OSError, ValueError) as exc:
+        atomic_json(directory / "terminal-exit.json", {"exit_code": 1, "token": launch["token"], "error": str(exc)})
+        return 1
+    exit_code = subprocess.call(launch["args"], cwd=launch["cwd"], env=environment)
     atomic_json(directory / "terminal-exit.json", {"exit_code": exit_code, "token": launch["token"]})
     return exit_code
 
@@ -79,7 +98,7 @@ def supervise_terminal(directory, launch):
                 saved = json.loads(terminal_exit.read_text())
                 if saved.get("token") != launch["token"]:
                     raise ValueError("Terminal exit belongs to another launch.")
-                error = f"Codex terminal exited with code {saved['exit_code']} before submitting a completed result."
+                error = saved.get("error") or f"Codex terminal exited with code {saved['exit_code']} before submitting a completed result."
                 break
             if time.monotonic() >= deadline:
                 error = "Codex exceeded the configured run timeout."

@@ -1,4 +1,5 @@
 import json
+import hashlib
 import os
 import pty
 import select
@@ -10,6 +11,7 @@ import tempfile
 import time
 import unittest
 import uuid
+from unittest.mock import patch
 
 from agentic_louis import ROOT
 from agentic_louis.process import atomic_json, command, CommandError, identity
@@ -71,6 +73,30 @@ class TmuxTests(unittest.TestCase):
         self.assertEqual(json.loads((self.directory / "completion.json").read_text()), saved)
         with self.assertRaises(ValueError):
             notify(self.directory, "wrong-token", self.notification())
+
+    def test_gitlab_token_is_acquired_on_host_and_reaches_agent_through_tmux(self):
+        helper_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(helper_directory.cleanup)
+        helper = Path(helper_directory.name) / "ddtool"
+        helper.write_text("#!/bin/sh\nprintf '%s\\n' 'fresh-test-gitlab-credential'\n")
+        helper.chmod(0o700)
+        self.launch["gitlab_repository"] = "DataDog/trajectory"
+        digest = hashlib.sha256(b"fresh-test-gitlab-credential").hexdigest()
+        script = (
+            "import hashlib,json,os,sys; from pathlib import Path; "
+            "Path(sys.argv[1], 'auth-check.json').write_text(json.dumps({"
+            f"'authenticated': hashlib.sha256(os.environ.get('GITLAB_TOKEN', '').encode()).hexdigest() == '{digest}',"
+            "'host': os.environ.get('GITLAB_HOST')}))"
+        )
+        with patch.dict(os.environ, {"PATH": helper_directory.name + os.pathsep + os.environ["PATH"],
+                                     "GITLAB_TOKEN": "stale-inherited-credential"}):
+            process = self.start(script)
+            process.wait(timeout=10)
+        report = json.loads((self.directory / "auth-check.json").read_text())
+        self.assertEqual(report, {"authenticated": True, "host": "gitlab.ddbuild.io"})
+        for path in self.directory.iterdir():
+            if path.is_file():
+                self.assertNotIn("fresh-test-gitlab-credential", path.read_text())
 
     def test_terminal_keeps_running_between_turns_and_completes_after_handoff(self):
         process = self.start("import sys,time; print('interactive terminal', flush=True); time.sleep(60)")

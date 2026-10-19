@@ -8,7 +8,7 @@ Queue work from your local agent and run Codex on remote project workspaces. Jir
 2. **The remote worker claims it.** The worker reserves a slot, moves the ticket to **In Progress**, and launches Codex in separate worktrees.
 3. **Codex implements the change.** It runs checks and publishes draft PRs for the affected repositories.
 4. **The worker verifies the result.** It comments in Jira, moves the ticket to **In Review**, and sends a Slack notification.
-5. **You review and finish.** Review comments, ready status, merging, and Jira completion remain manual.
+5. **You review and finish.** Optionally run `watch-prs` to address bot review comments and branch-introduced CI failures. Ready status, merging, and Jira completion remain manual.
 
 **Each project has five slots shared by In Progress and In Review tickets.** A draft PR keeps its slot until its ticket leaves those columns. Move a finished ticket out of In Review to release capacity.
 
@@ -208,6 +208,121 @@ The dry run prints the discovered repositories, base branches, state directory, 
 It does not change Jira or launch agents.
 The regular command runs in the foreground and can be used in tmux or a process supervisor.
 
+### Watch PR reviews and failing checks
+
+```sh
+agentic-louis watch-prs --project trajectory --dry-run
+agentic-louis watch-prs --project trajectory
+# Watch just one PR:
+agentic-louis watch-prs https://github.com/OWNER/REPO/pull/123 --project trajectory
+# Or reuse an explicit repository group:
+agentic-louis watch-prs --config /path/to/workspace.json
+```
+
+`watch-prs` immediately scans the configured or discovered repositories and repeats
+every five minutes. It watches open PRs authored by the authenticated `gh` user
+whose head branch lives in the same repository, including draft PRs. Fork PRs
+are excluded. It needs GitHub and Codex authentication and tmux, but no Jira or
+Slack credentials. `--dry-run` prints each matching PR's number and title,
+failing check names, and count of bot comments in unresolved review threads without
+creating worktrees, changing checkpoints, or starting agents.
+
+Pass a positional PR URL (or `--pr URL`) to fetch only that PR, including PRs by other authors. Its repository
+must be configured or discovered locally; fork PRs remain excluded. Only that
+PR's saved agent is supervised, and prerequisites are checked only for its repository.
+
+Discovery uses GitHub APIs to read check runs and commit statuses on both the
+head and test merge commit, plus unresolved bot review threads (including
+outdated threads). PRs, checks, statuses, threads, and long comment conversations
+are paginated. The latest attempt per CI provider and job is selected before
+filtering failures, including across head and merge commits; successful or running
+retries supersede older failures. Bot authors are recognized by GitHub's `Bot` author type or a
+`[bot]` login suffix. The legacy `chatgpt-codex-connector` and `codex` author
+names are also recognized.
+
+One agent handles both kinds of feedback for a PR, with at most five PR agents
+running at once. Each agent gets a separate worktree, review conversations, PR
+references, and only the names of failed jobs as CI context. It investigates job
+logs and base-branch behavior itself, rechecks for successful retries, and
+independently validates bot findings. Check IDs, URLs, states, base-branch check
+results, and configured validation commands are not included in the prompt.
+Uncertain attribution or unavailable validation blocks the attempt and leaves its
+evidence in the logs.
+
+Python host-side integrations can acquire a short-lived GitLab project token with:
+
+```python
+from agentic_louis.ddtool import gitlab_project_token
+
+token = gitlab_project_token("DataDog", "trajectory")
+```
+
+For DataDog repositories, the watcher calls this helper from the host-side tmux
+launcher after repository setup, immediately before starting Codex. It passes
+`GITLAB_TOKEN` and `GITLAB_HOST=gitlab.ddbuild.io` through the agent process
+environment. The token is never written to launch metadata, prompts, command
+arguments, or logs. Authentication failure prevents Codex from starting and is
+reported in the saved attempt result. Dry runs do not acquire credentials;
+repositories outside the DataDog organization do not require `ddtool`.
+
+The prompt tells the agent to use the supplied environment token directly in
+GitLab API request headers instead of invoking credential helpers inside its
+sandbox. `ddtool` must be installed and authenticated on the workstation. This
+applies to newly launched PR watcher agents; existing agents must be restarted
+to receive a token.
+
+Watcher agents use `gpt-6.1-sol`. After covering all findings and passing validation
+(with evidence for any failures proven identical on the base branch), they commit
+and push fixes to the existing PR branch, then reply to and resolve covered
+threads. Invalid or already fixed findings receive an explanation without an
+empty commit. Agents use ordinary fast-forward pushes and stop if the remote
+head changed. The watcher does not merge PRs, change draft status, or move Jira
+tickets.
+
+Checkpoints, logs, results, and worktrees live under
+`<state-dir>/watch-prs/<repository-name>/<pr-number>/`. A separate lock lets this
+command run alongside the Jira worker. Detached agents continue when the watcher
+stops; restarting adopts their saved supervision metadata. Each launch logs a
+copyable `tmux ... attach-session -t agent` command to view the agent terminal.
+Launch logs group the PR link, feedback counts, and attach command in one block;
+full check names and the head SHA remain in the saved `launch.json`.
+Detach with `Ctrl-b`, then `d` to leave the agent running. Each PR head commit
+is attempted only once, including failed setup attempts. Changed checks, base
+revisions, or comments on that commit do not launch another agent. New head
+commits are eligible on the next poll; previously attempted commits remain
+skipped across restarts and branch resets. Dry runs show only eligible PRs. To retry blocked attempts after
+fixing an environment problem, restart with `watch-prs --retry-blocked`; each PR
+is retried at most once per invocation. Keep using the same state directory to
+preserve overlap and duplicate protection.
+
+### Clean local agent worktrees and branches
+
+```sh
+agentic-louis clean --dry-run
+agentic-louis clean
+# Limit cleanup to a project's state directory or a configured repository group:
+agentic-louis clean --project trajectory
+agentic-louis clean --config /path/to/workspace.json
+agentic-louis clean --state-dir /path/to/saved-state
+```
+
+Run from a repository root or a folder containing repositories. `clean` removes
+managed worktrees and the local branches created for them by the PR watcher and
+Jira worker, including branches left behind after a worktree was removed manually.
+It discards uncommitted work and unmerged local commits on those branches.
+`--dry-run` previews the exact worktrees and branches without changing them.
+
+Without `--project`, cleanup checks all default project state directories for the
+selected local repositories. Use the same `--state-dir` or `--config` as the
+original command for custom locations. Cleanup runs locally without Jira, GitHub,
+Codex, or network authentication. It keeps logs and checkpoints, and does not
+delete remote branches. Stop workers, watchers, and detached agents first;
+cleanup refuses to run while they are active. Locked worktrees, worktrees whose
+branch changed, and branches checked out elsewhere are preserved with an error.
+Branches reused from an existing local branch are preserved.
+
+### Jira worker execution
+
 The worker stores logs, process metadata, and Git worktrees under `~/.local/state/agentic-louis/trajectory`.
 If `XDG_STATE_HOME` is set, it uses `$XDG_STATE_HOME/agentic-louis/trajectory` instead.
 Each project has a separate state directory and process lock.
@@ -264,7 +379,7 @@ are collapsed so the outcome and next steps stay easy to scan.
 ### Optional overrides
 
 Use `--state-dir /path/to/state` to override the default state directory.
-New agent runs explicitly use `gpt-6.1-sol`, overriding any model set in a profile.
+New Jira worker agent runs explicitly use `gpt-6.1-sol`, overriding any model set in a profile.
 Use `--profile NAME` to load `$CODEX_HOME/NAME.config.toml` for additional Codex settings.
 Without `--profile`, no worker profile file is needed.
 Interactive Codex loads the worker account's base configuration and optional
