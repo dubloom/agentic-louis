@@ -31,7 +31,11 @@ occupied, add `--port 7433` and open that port instead.
 The UI uses plain JavaScript and CSS; no Node installation or frontend build is
 needed. The workspace fits the window: code and explanations scroll independently,
 while the question box stays visible. Explanation and Conversation tabs share the
-right pane; overview, glossary, and extra step details expand when needed. On narrow
+right pane. An introduction below the title gives the question and overall
+context, with a clickable flow diagram when supplied. It is expanded by default;
+**Hide introduction** gives the code more room, and **Show introduction** brings
+it back. Older walkthroughs display their summary there. Glossary and extra
+step details expand when needed. On narrow
 screens, navigation opens from the menu button. Code coloring is lightweight, rather than
 a full language parser.
 

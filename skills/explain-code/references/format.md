@@ -9,6 +9,14 @@ Author a plan like this (line numbers are illustrative; replace them with verifi
   "version": 1,
   "title": "How a request becomes a response",
   "summary": "A request enters the router, is validated, and reaches the handler. This walkthrough follows a successful request and explains the validation failure branch.",
+  "introduction": {
+    "request": "How does an incoming request become a response?",
+    "body": "The router chooses a handler based on the request URL. The handler turns the validated input into a response. This separates deciding where a request goes from doing the work. Follow a concrete request through these two components, then inspect the failure paths in the steps below.",
+    "flow": [
+      {"title": "Route the request", "description": "Choose a handler", "step_id": "route"},
+      {"title": "Build the response", "description": "Produce the result", "step_id": "handle"}
+    ]
+  },
   "files": [
     {"path": "src/router.py", "language": "python"},
     {"path": "src/handler.py", "language": "python"}
@@ -41,6 +49,15 @@ Author a plan like this (line numbers are illustrative; replace them with verifi
 ```
 
 Required document keys: `version` (integer 1), `title`, `summary`, `files` (1–100), `steps` (1–300). Required file keys after bundling: `path`, `language`, `content`, `sha256`. Content is exact, nonempty UTF-8 source text; the lowercase SHA-256 hex digest is computed from `content.encode('utf-8')`. Empty or whitespace-only files are not accepted. Each step requires a unique `id`, `title`, `explanation`, `file`, `start_line`, and `end_line`. `inputs`, `outputs`, `watch_for` and `glossary` are optional. File paths are unique. Multiple steps may reference the same file and overlapping ranges. Use a concise name such as `python`, `typescript`, `go` or `rust` for `language`; highlighting is lightweight and language-independent.
+
+New walkthroughs should include `introduction`: an object with a required nonempty
+`body` (Markdown), an optional nonempty `request` (the question or scope), and an
+optional `flow` array of up to 12 nodes. Each node requires a nonempty `title`;
+`description` is optional text, and `step_id`, when present, must identify an
+existing walkthrough step. Nodes are displayed in order with arrows. Linked nodes
+jump to the corresponding step. Keep branching, loops, and omitted paths clear
+in the surrounding text. Older version-1 files without an introduction still
+open: their summary is shown as the introduction, without an invented diagram.
 
 Use the pipx-installed `agentic-louis` command from any directory:
 

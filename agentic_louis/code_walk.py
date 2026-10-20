@@ -86,6 +86,21 @@ def validate(document):
         require(isinstance(entry, dict), "Glossary entries must be objects")
         string(entry, "term")
         string(entry, "definition")
+    intro = document.get("introduction")
+    if "introduction" in document:
+        require(isinstance(intro, dict), "introduction must be an object")
+        string(intro, "body")
+        if "request" in intro:
+            string(intro, "request")
+        flow = intro.get("flow", [])
+        require(isinstance(flow, list) and len(flow) <= 12, "introduction.flow must contain at most 12 nodes")
+        for node in flow:
+            require(isinstance(node, dict), "Each flow node must be an object")
+            string(node, "title")
+            require("description" not in node or isinstance(node["description"], str), "Flow description must be text")
+            if "step_id" in node:
+                string(node, "step_id")
+                require(node["step_id"] in ids, "Flow node references an unknown step")
     require(len(json.dumps(document, ensure_ascii=False).encode()) <= MAX_BYTES, "Walkthrough exceeds the 2 MB limit")
     return document
 

@@ -113,5 +113,31 @@
       "term": "Process group",
       "definition": "A collection of processes that can receive a signal together, useful for cleaning up commands and their children."
     }
-  ]
+  ],
+  "introduction": {
+    "request": "How does the worker start another program and handle its result?",
+    "body": "The worker delegates tasks such as Git operations to other programs. A shared command helper gives these calls consistent behavior: pass arguments directly, capture output, enforce a deadline, and report useful failures. For example, a successful git status call returns a string describing local changes.\n\nThe flow below follows a successful command. The detailed walkthrough also covers timeout cleanup and redacted error messages, which are alternative paths when execution fails.",
+    "flow": [
+      {
+        "title": "Prepare",
+        "description": "Arguments and environment",
+        "step_id": "prepare"
+      },
+      {
+        "title": "Start",
+        "description": "Launch the child program",
+        "step_id": "launch"
+      },
+      {
+        "title": "Wait",
+        "description": "Collect output with a deadline",
+        "step_id": "wait"
+      },
+      {
+        "title": "Return",
+        "description": "Output or a useful error",
+        "step_id": "result"
+      }
+    ]
+  }
 }

@@ -84,6 +84,22 @@ class WalkthroughTests(unittest.TestCase):
             with self.subTest(change=change), self.assertRaises(ValueError):
                 chat_prompt({**payload, **change})
 
+    def test_optional_introduction_and_flow_references(self):
+        introduction = {'request': 'How does this return a value?', 'body': 'A small function returns a greeting.',
+                        'flow': [{'title': 'Return', 'description': 'A greeting', 'step_id': 'entry'},
+                                 {'title': 'Result'}]}
+        doc = {**self.doc, 'introduction': introduction}
+        self.assertEqual(validate(doc)['introduction'], introduction)
+        self.assertIn('A small function returns a greeting.', chat_prompt({'document': doc, 'question': 'Why?'}))
+        self.assertEqual(validate(self.doc), self.doc)  # Existing version-1 artifacts remain valid.
+        for invalid in (None, 'text', {}, {'body': ''}, {'body': 'OK', 'request': ''},
+                        {'body': 'OK', 'flow': {}}, {'body': 'OK', 'flow': ['text']},
+                        {'body': 'OK', 'flow': [{'title': 'Unknown', 'step_id': 'missing'}]},
+                        {'body': 'OK', 'flow': [{'title': 'Node', 'description': 7}]},
+                        {'body': 'OK', 'flow': [{'title': 'Node'}] * 13}):
+            with self.subTest(introduction=invalid), self.assertRaises(ValueError):
+                validate({**self.doc, 'introduction': invalid})
+
     def test_codex_extracts_answer_and_enforces_readonly(self):
         process = Mock(returncode=0)
         process.communicate.return_value = ('\n'.join(json.dumps(e) for e in [

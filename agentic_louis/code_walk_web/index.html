@@ -15,7 +15,7 @@
     <div class="sidebar-scroll">
       <div class="sidebar-heading"><span class="eyebrow">STEPS</span><span id="step-count"></span></div>
       <nav id="steps" aria-label="Walkthrough steps"></nav>
-      <details class="reference"><summary>Overview <span id="file-count"></span></summary><p id="summary"></p></details>
+      <div id="file-count" class="sidebar-meta"></div>
       <details id="glossary-section" class="reference"><summary>Glossary</summary><div id="glossary"></div></details>
     </div>
     <button id="download" class="export-button">↓ Export walkthrough</button>
@@ -25,6 +25,14 @@
       <div class="walkthrough-title"><h1 id="title">Code Walk</h1><span id="progress-label"></span></div>
       <div class="step-controls"><button id="previous" aria-label="Previous step">←</button><button id="next" class="primary">Next step →</button></div>
     </div>
+    <section id="introduction" class="introduction" aria-labelledby="introduction-label" hidden>
+      <div class="introduction-header"><span id="introduction-label" class="eyebrow">INTRODUCTION</span><button id="toggle-introduction" class="text-button" aria-expanded="true" aria-controls="introduction-content">Hide introduction ↑</button></div>
+      <div id="introduction-content" tabindex="0">
+        <p id="introduction-request" class="introduction-request" hidden></p>
+        <div id="summary" class="prose"></div>
+        <ol id="introduction-flow" class="introduction-flow" aria-label="Overview of the flow" hidden></ol>
+      </div>
+    </section>
     <div class="progress-track"><div id="progress"></div></div>
     <div class="reading-grid">
       <section class="source-panel" aria-label="Source code">

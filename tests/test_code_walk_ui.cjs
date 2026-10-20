@@ -42,10 +42,10 @@ function app() {
     }});
   const script = fs.readFileSync(path.join(__dirname, '../agentic_louis/code_walk_web/app.js'), 'utf8');
   vm.runInContext(script.replace(/start\(\);\s*$/, ''), context);
-  const api = vm.runInContext('({state, attachAnswerFiles, message, ask})', context);
+  const api = vm.runInContext('({state, attachAnswerFiles, message, ask, renderIntroduction, renderStep})', context);
   api.state.document = {version: 1, title: 'Example', summary: 'Example flow',
     files: [{path: 'main.py', language: 'python', content: 'def main():\n    return helper()\n', sha256: 'existing'}],
-    steps: [{id: 'entry', file: 'main.py', start_line: 1, end_line: 2}]};
+    steps: [{id: 'entry', title: 'Main', explanation: 'Calls the helper.', file: 'main.py', start_line: 1, end_line: 2}]};
   api.state.file = 'main.py';
   return {api, nodes, document, requests};
 }
@@ -83,4 +83,40 @@ test('related code and unavailable-file messages are rendered as text', () => {
   const message = api.message('assistant', '<script>bad()</script>', [], ['File unavailable: <img src=x>']);
   assert.equal(message.children.find(node => node.className === 'attachment-warning').textContent, 'File unavailable: <img src=x>');
   assert.ok(message.children.find(node => node.className === 'prose').children.every(node => node.tagName === 'p'));
+});
+
+test('introduction is visible by default, toggles, and remains collapsed when navigating', () => {
+  const {api, nodes} = app();
+  api.renderIntroduction(api.state.document);
+  assert.equal(nodes.get('introduction').hidden, false);
+  assert.equal(nodes.get('introduction-content').hidden, false);
+  assert.equal(nodes.get('toggle-introduction').attributes['aria-expanded'], 'true');
+  assert.equal(nodes.get('summary').children[0].children[0].textContent, 'Example flow');
+  assert.equal(nodes.get('introduction-flow').hidden, true);
+  nodes.get('toggle-introduction').onclick();
+  assert.equal(nodes.get('introduction-content').hidden, true);
+  api.renderStep();
+  assert.equal(nodes.get('introduction-content').hidden, true);
+  nodes.get('toggle-introduction').onclick();
+  assert.equal(nodes.get('introduction-content').hidden, false);
+  nodes.get('toggle-introduction').onclick();
+  api.renderIntroduction(api.state.document);
+  assert.equal(nodes.get('introduction-content').hidden, false); // A newly opened walkthrough starts expanded.
+});
+
+test('authored flow opens its step and highlights it without hiding the introduction', () => {
+  const {api, nodes} = app();
+  api.state.document.steps.push({id: 'result', title: 'Result', explanation: 'Returns the value.', file: 'main.py', start_line: 2, end_line: 2});
+  api.state.document.introduction = {request: 'Where does the value come from?', body: 'Main delegates to a helper.',
+    flow: [{title: 'Main', step_id: 'entry'}, {title: 'Return value', description: 'The result', step_id: 'result'}]};
+  api.renderIntroduction(api.state.document);
+  assert.equal(nodes.get('introduction-request').textContent, 'Where does the value come from?');
+  const diagram = nodes.get('introduction-flow');
+  assert.equal(diagram.hidden, false);
+  assert.equal(diagram.children.length, 2);
+  diagram.children[1].lastElementChild.onclick();
+  assert.equal(api.state.index, 1);
+  assert.equal(nodes.get('step-title').textContent, 'Result');
+  assert.equal(diagram.children[1].lastElementChild.attributes['aria-current'], 'step');
+  assert.equal(nodes.get('introduction-content').hidden, false);
 });

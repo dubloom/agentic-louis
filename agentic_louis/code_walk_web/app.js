@@ -65,6 +65,43 @@ function highlight(parent, text) {
   parent.append(document.createTextNode(text.slice(previous)));
 }
 function activeStep() { return state.document.steps[state.index]; }
+function setIntroductionOpen(open) {
+  $('introduction-content').hidden = !open;
+  $('introduction').classList.toggle('collapsed', !open);
+  $('toggle-introduction').setAttribute('aria-expanded', String(open));
+  $('toggle-introduction').textContent = open ? 'Hide introduction ↑' : 'Show introduction ↓';
+}
+function renderIntroduction(doc) {
+  const intro = doc.introduction;
+  $('introduction').hidden = false;
+  $('introduction-request').hidden = !intro?.request;
+  $('introduction-request').textContent = intro?.request || '';
+  prose($('summary'), intro?.body || doc.summary);
+  $('introduction-flow').replaceChildren();
+  $('introduction-flow').hidden = !intro?.flow?.length;
+  for (const [index, node] of (intro?.flow || []).entries()) {
+    const item = element('li', 'flow-item');
+    if (index) { const arrow = element('span', 'flow-arrow', '→'); arrow.setAttribute('aria-hidden', 'true'); item.append(arrow); }
+    const box = element(node.step_id ? 'button' : 'div', 'flow-node');
+    box.append(element('span', 'flow-title', node.title));
+    if (node.description) box.append(element('span', 'flow-description', node.description));
+    if (node.step_id) {
+      box.dataset.step = node.step_id;
+      box.title = 'Jump to this part of the walkthrough';
+      box.onclick = () => { state.index = state.document.steps.findIndex(step => step.id === node.step_id); renderStep(); };
+    }
+    item.append(box); $('introduction-flow').append(item);
+  }
+  setIntroductionOpen(true);
+}
+function updateIntroductionFlow() {
+  for (const item of $('introduction-flow').children) {
+    const node = item.lastElementChild;
+    const active = node.dataset.step === activeStep().id;
+    node.classList.toggle('active', active);
+    if (active) node.setAttribute('aria-current', 'step'); else node.removeAttribute('aria-current');
+  }
+}
 function updateContext() {
   const step = activeStep();
   $('context').textContent = state.selection ? `Context: ${state.file}:${state.selection.start}–${state.selection.end}` : `Context: step ${state.index + 1} · ${step.file}:${step.start_line}–${step.end_line}`;
@@ -155,6 +192,7 @@ function renderStep() {
   $('progress').style.width = `${(state.index + 1) / total * 100}%`;
   $('progress-label').textContent = `Step ${state.index + 1} of ${total}`;
   [...$('steps').children].forEach((button, index) => { button.classList.toggle('active', index === state.index); if (index === state.index) button.setAttribute('aria-current', 'step'); else button.removeAttribute('aria-current'); });
+  updateIntroductionFlow();
   showPanel('guide');
   renderCode();
 }
@@ -165,7 +203,8 @@ async function loadDocument(doc) {
   $('messages').replaceChildren();
   $('chat-empty').hidden = false;
   $('reply-indicator').hidden = true;
-  $('title').textContent = doc.title; $('summary').textContent = doc.summary;
+  $('title').textContent = doc.title;
+  renderIntroduction(doc);
   document.title = `${doc.title} · Code Walk`;
   $('file-count').textContent = `${doc.files.length} source ${doc.files.length === 1 ? 'file' : 'files'}`;
   $('step-count').textContent = doc.steps.length;
@@ -254,6 +293,7 @@ async function ask(event) {
   finally { pending.remove(); state.busy = false; $('send').disabled = false; $('import-button').disabled = false; $('library').disabled = false; $('clear-chat').disabled = false; $('model').disabled = false; $('custom-model').disabled = false; }
 }
 $('previous').onclick = () => { if (state.index > 0) { state.index--; renderStep(); } };
+$('toggle-introduction').onclick = () => setIntroductionOpen($('introduction-content').hidden);
 $('next').onclick = () => { if (state.index < state.document.steps.length - 1) { state.index++; renderStep(); } };
 $('files').onchange = () => { state.file = $('files').value; state.selection = null; renderCode(); };
 $('code').onpointerdown = event => {
