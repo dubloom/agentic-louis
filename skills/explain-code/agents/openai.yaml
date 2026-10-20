@@ -1,0 +1,4 @@
+interface:
+  display_name: "Explain Code"
+  short_description: "Create guided code walkthroughs for Code Walk"
+  default_prompt: "Use $explain-code to explain this code in a Code Walk walkthrough."

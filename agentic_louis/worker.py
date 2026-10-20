@@ -686,19 +686,26 @@ class Worker:
 
 
 def main(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if argv[:1] == ["code-walk"]:
+        from .code_walk import main as code_walk_main
+        return code_walk_main(argv[1:], prog="agentic-louis code-walk")
     load_dotenv(Path.cwd() / ".env", override=False)
-    parser = argparse.ArgumentParser(description="Run a project workspace queue or watch PR checks and Codex reviews.")
+    parser = argparse.ArgumentParser(description="Run project queues, watch PRs, or explore code with Code Walk.",
+                                     epilog="Code walkthroughs: agentic-louis code-walk {serve,bundle,validate} --help")
     parser.add_argument("--project", help="Project to run; defaults to the config file's project. Omit with blocked or clean for all projects.")
     parser.add_argument("--state-dir", type=Path, help="Override the persistent state directory.")
     parser.add_argument("--profile", help="Optional Codex profile name.")
     parser.add_argument("--config", type=Path, help="Workspace JSON file (default: ./agentic-louis.json when present).")
-    parser.add_argument("action", nargs="?", choices=("run", "watch-prs", "clean", "status", "blocked", "resume", "retry", "resend", "check"), default="run")
+    parser.add_argument("action", nargs="?", choices=("run", "watch-prs", "clean", "status", "blocked", "resume", "retry", "resend", "check", "code-walk"), default="run")
     parser.add_argument("key", nargs="?", help="Jira issue key, or a GitHub PR URL with watch-prs.")
     parser.add_argument("--attempt", type=int, help="Saved attempt number required by resume.")
     parser.add_argument("--dry-run", action="store_true", help="Preview matching work or cleanup without mutations.")
     parser.add_argument("--retry-blocked", action="store_true", help="With watch-prs, retry each blocked PR once even if feedback is unchanged.")
     parser.add_argument("--pr", help="With watch-prs, watch only this GitHub PR URL in a configured or discovered repository.")
     args = parser.parse_args(argv)
+    if args.action == "code-walk":
+        parser.error("Use agentic-louis code-walk {serve,bundle,validate}; worker options do not apply to code-walk")
     if args.retry_blocked and args.action != "watch-prs":
         parser.error("--retry-blocked requires watch-prs")
     if args.pr and args.action != "watch-prs":

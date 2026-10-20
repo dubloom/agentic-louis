@@ -1,0 +1,22 @@
+{
+  "type": "object",
+  "properties": {
+    "answer": {"type": "string"},
+    "references": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "path": {"type": "string"},
+          "start_line": {"type": "integer"},
+          "end_line": {"type": "integer"},
+          "explanation": {"type": "string"}
+        },
+        "required": ["path", "start_line", "end_line", "explanation"],
+        "additionalProperties": false
+      }
+    }
+  },
+  "required": ["answer", "references"],
+  "additionalProperties": false
+}

@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Code Walk · Understand what happens</title><link rel="stylesheet" href="/style.css"><script src="/app.js" defer></script></head>
+<body>
+<header class="topbar">
+  <button id="toggle-sidebar" class="icon-button" aria-label="Toggle walkthrough navigation" aria-expanded="false" aria-controls="sidebar">☰</button>
+  <a class="brand" href="/" aria-label="Code Walk home"><span class="logo">cw</span> Code Walk</a>
+  <span id="repo" class="repo"></span>
+  <button id="import-button">Open walkthrough</button><input type="file" id="import-file" accept=".json" hidden>
+</header>
+<div id="notice" role="alert" hidden></div>
+<div class="workspace">
+  <aside id="sidebar" class="sidebar" aria-label="Walkthrough navigation">
+    <label for="library" class="eyebrow">WALKTHROUGH</label><select id="library"></select>
+    <div class="sidebar-scroll">
+      <div class="sidebar-heading"><span class="eyebrow">STEPS</span><span id="step-count"></span></div>
+      <nav id="steps" aria-label="Walkthrough steps"></nav>
+      <details class="reference"><summary>Overview <span id="file-count"></span></summary><p id="summary"></p></details>
+      <details id="glossary-section" class="reference"><summary>Glossary</summary><div id="glossary"></div></details>
+    </div>
+    <button id="download" class="export-button">↓ Export walkthrough</button>
+  </aside>
+  <main>
+    <div class="walkthrough-toolbar">
+      <div class="walkthrough-title"><h1 id="title">Code Walk</h1><span id="progress-label"></span></div>
+      <div class="step-controls"><button id="previous" aria-label="Previous step">←</button><button id="next" class="primary">Next step →</button></div>
+    </div>
+    <div class="progress-track"><div id="progress"></div></div>
+    <div class="reading-grid">
+      <section class="source-panel" aria-label="Source code">
+        <div class="panel-header"><label for="files" class="sr-only">Source file</label><select id="files"></select><span id="source-status" class="status"></span></div>
+        <div class="code-caption"><span id="language"></span><span id="range"></span></div>
+        <div id="code" tabindex="0" aria-label="Code with line numbers"></div>
+        <div class="code-footer"><span>Drag across lines to select · Shift-click to extend</span><button id="clear-selection" hidden>Clear selection</button></div>
+      </section>
+      <section class="right-panel" aria-label="Explanation and questions">
+        <div class="panel-tabs" role="tablist" aria-label="Reading panel">
+          <button id="guide-tab" role="tab" aria-selected="true" aria-controls="guide-panel" tabindex="0">Explanation</button>
+          <button id="chat-tab" role="tab" aria-selected="false" aria-controls="chat-panel" tabindex="-1">Conversation <span id="reply-indicator" hidden>●</span></button>
+        </div>
+        <div id="guide-panel" class="explanation-panel" role="tabpanel" aria-labelledby="guide-tab" tabindex="0">
+          <div class="explanation-body"><div class="step-meta"><span id="step-number"></span><span id="step-location" class="location"></span></div><h2 id="step-title"></h2><div id="explanation" class="prose"></div><details id="step-details" class="reference"><summary>Inputs, outputs & things to know</summary><div id="details"></div></details><button id="ask-step" class="text-button">Explain with an example ↗</button></div>
+        </div>
+        <div id="chat-panel" class="conversation" role="tabpanel" aria-labelledby="chat-tab" tabindex="0" hidden>
+          <div class="chat-heading"><span>Questions about this code</span><button id="clear-chat" class="text-button">Clear</button></div>
+          <div id="messages" aria-live="polite"></div>
+          <div id="chat-empty"><h2>What would you like to understand?</h2><p>Ask about the current step or select lines in the code.</p><div id="suggestions"><button data-question="Can you explain this step with a concrete example?">Show me an example ↗</button><button data-question="What could go wrong in this step?">What could go wrong? ↗</button><button data-question="How does this step connect to the rest of the flow?">How does this fit together? ↗</button></div></div>
+        </div>
+        <div class="composer">
+          <div class="context-bar"><span id="context">Context: current step</span></div>
+          <form id="chat-form"><label for="question" class="sr-only">Ask a question about the code</label><textarea id="question" rows="2" maxlength="8000" placeholder="Ask about this code…" required></textarea><button class="primary" id="send" type="submit" title="Ask agent (⌘/Ctrl+Enter)">Ask ↑</button></form>
+          <div class="chat-footer"><div class="model-picker"><label for="model">Model</label><select id="model" aria-label="Model for the next question"><option value="">Codex default</option><option value="custom">Custom model…</option></select></div><span id="agent-status">Codex · read-only</span></div>
+          <input id="custom-model" class="custom-model" aria-label="Custom model ID" maxlength="128" placeholder="Enter a model ID available to your account" autocomplete="off" spellcheck="false" hidden>
+        </div>
+      </section>
+    </div>
+  </main>
+</div>
+</body></html>

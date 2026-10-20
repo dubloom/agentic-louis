@@ -1,0 +1,117 @@
+{
+  "version": 1,
+  "title": "How the worker runs a command",
+  "summary": "Follow a Git command from an argument list to a result. Along the way, see how the worker passes an environment, captures output, handles timeouts, and turns failures into readable errors. This is a curated reading path through the success and failure branches in process.py.",
+  "files": [
+    {
+      "path": "agentic_louis/process.py",
+      "language": "python",
+      "content": "import json\nimport os\nfrom pathlib import Path\nimport re\nimport shlex\nimport signal\nimport subprocess\n\n\nclass CommandError(ValueError):\n    pass\n\n\ndef redact(text, env):\n    for name, value in env.items():\n        if value and re.search(r\"TOKEN|PASSWORD|SECRET|API_KEY|WEBHOOK|SLACK_WORKFLOW_URL\", name, re.I):\n            text = text.replace(value, \"[redacted]\")\n    return re.sub(r\"(https?://)[^\\s/@]+@\", r\"\\1[redacted]@\", text)\n\n\ndef child_environment():\n    return {k: v for k, v in os.environ.items()\n            if not k.startswith(\"JIRA_\") and k != \"SLACK_WORKFLOW_URL\"}\n\n\ndef command(args, *, cwd=None, timeout=60, env=None, log_path=None):\n    effective_env = env if env is not None else child_environment()\n    invocation = shlex.join([str(arg) for arg in args])\n    location = str(Path(cwd or Path.cwd()).resolve())\n\n    def failure(reason, output=\"\"):\n        detail = f\"Command {invocation} {reason}\\nWorking directory: {location}\"\n        if output.strip():\n            detail += \"\\n\" + output.strip()\n        return CommandError(redact(detail, {**os.environ, **effective_env}))\n\n    try:\n        process = subprocess.Popen([str(a) for a in args], cwd=cwd, env=effective_env,\n                                   text=True, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,\n                                   stderr=subprocess.PIPE, start_new_session=True)\n    except OSError as error:\n        raise failure(f\"could not start: {error}\") from None\n    timed_out = False\n    try:\n        stdout, stderr = process.communicate(timeout=timeout)\n    except subprocess.TimeoutExpired:\n        timed_out = True\n        stop_group(process)\n        stdout, stderr = process.communicate()\n    if log_path is not None:\n        Path(log_path).write_text(stdout + \"\\n\" + stderr)\n    if timed_out:\n        raise failure(f\"exceeded its {timeout}s timeout.\", stderr or stdout)\n    if process.returncode:\n        raise failure(f\"failed (exit {process.returncode}).\", stderr or stdout)\n    return stdout.strip()\n\n\ndef atomic_json(path, value):\n    path = Path(path)\n    temporary = path.with_suffix(path.suffix + \".tmp\")\n    with temporary.open(\"w\") as out:\n        json.dump(value, out, indent=2)\n        out.flush()\n        os.fsync(out.fileno())\n    temporary.replace(path)\n\n\ndef identity(pid):\n    try:\n        os.kill(pid, 0)\n        if command([\"ps\", \"-p\", str(pid), \"-o\", \"stat=\"]).startswith(\"Z\"):\n            return None\n        return command([\"ps\", \"-p\", str(pid), \"-o\", \"lstart=\"])\n    except (OSError, CommandError):\n        return None\n\n\ndef stop_group(process):\n    if process.poll() is not None:\n        return\n    try:\n        os.killpg(process.pid, signal.SIGTERM)\n        process.wait(timeout=10)\n    except subprocess.TimeoutExpired:\n        os.killpg(process.pid, signal.SIGKILL)\n        process.wait()\n    except ProcessLookupError:\n        process.wait()\n",
+      "sha256": "209a8bae4f24d9f39e95f15bc972b6ea407a66ce89591790158467ec09bbe4f8"
+    }
+  ],
+  "steps": [
+    {
+      "id": "prepare",
+      "title": "Prepare a command",
+      "start_line": 26,
+      "end_line": 29,
+      "explanation": "The worker uses `command(...)` whenever it needs another program, such as Git. It supplies an argument list: for example, `[\"git\", \"status\", \"--short\"]`. The helper chooses the child environment and records a readable command and directory for later error messages.\n\n`shlex.join` is used for the description; the command itself is passed as a list to `Popen` in a later step.",
+      "inputs": "Arguments, an optional directory, timeout, environment and log path.",
+      "outputs": "An environment for the child and a description for diagnostics.",
+      "watch_for": "An explicitly supplied environment replaces the filtered default.",
+      "file": "agentic_louis/process.py"
+    },
+    {
+      "id": "environment",
+      "title": "Limit inherited credentials",
+      "start_line": 21,
+      "end_line": 23,
+      "explanation": "When no environment is supplied, `child_environment()` copies the current environment while dropping names beginning with `JIRA_` and the Slack workflow URL. The child still gets ordinary settings such as `PATH`, so executables can be found.\n\nThe default path returns here from `command` before the program starts.",
+      "inputs": "The parent process environment.",
+      "outputs": "A new dictionary with the selected variables removed.",
+      "watch_for": "This is a specific filter, not a general secret scrubber; other credentials are inherited.",
+      "file": "agentic_louis/process.py"
+    },
+    {
+      "id": "launch",
+      "title": "Start the child process",
+      "start_line": 37,
+      "end_line": 43,
+      "explanation": "`Popen` starts the executable directly with its arguments. For our example, Git receives `status` and `--short`; no shell interprets them. Standard input is disconnected, and standard output and error are captured separately.\n\n`start_new_session=True` gives the command its own process group so timeout cleanup can also reach processes it starts.",
+      "inputs": "Prepared arguments and environment.",
+      "outputs": "A running process, or a CommandError when it cannot start.",
+      "watch_for": "Starting successfully does not mean the command will finish successfully.",
+      "file": "agentic_louis/process.py"
+    },
+    {
+      "id": "wait",
+      "title": "Wait, with a deadline",
+      "start_line": 44,
+      "end_line": 49,
+      "explanation": "`communicate` waits for completion while collecting both output streams. The default deadline is 60 seconds. If Git finishes in time, execution continues to the result checks.\n\nIf the deadline expires, the helper remembers the timeout, calls `stop_group`, and collects the remaining output. The next step follows that timeout branch.",
+      "inputs": "A running child process and the timeout in seconds.",
+      "outputs": "Captured stdout and stderr; on timeout, a stopped process.",
+      "watch_for": "The deadline covers communicate; cleanup can add more time.",
+      "file": "agentic_louis/process.py"
+    },
+    {
+      "id": "stop",
+      "title": "Clean up a timed-out process",
+      "start_line": 79,
+      "end_line": 89,
+      "explanation": "`stop_group` first checks whether the process has already exited. Otherwise it sends `SIGTERM` to the process group, giving it up to ten seconds to shut down. If it still runs, `SIGKILL` forces termination.\n\nA process that disappears during cleanup is handled by waiting for its recorded exit. Control then returns to `command`.",
+      "inputs": "The process started in its own session.",
+      "outputs": "A process that has been waited for.",
+      "watch_for": "Commands that detach into another process group may escape this group-based cleanup.",
+      "file": "agentic_louis/process.py"
+    },
+    {
+      "id": "result",
+      "title": "Return output or raise an error",
+      "start_line": 50,
+      "end_line": 56,
+      "explanation": "If a log path was supplied, the helper saves both streams first. Then it raises for a timeout or nonzero exit code.\n\nOn success, our `git status --short` example returns the captured standard output with surrounding whitespace removed. An empty string can be a successful result when the working tree is clean.",
+      "inputs": "Captured output, exit status and the timeout flag.",
+      "outputs": "Trimmed stdout, or a CommandError.",
+      "watch_for": "The optional log contains raw output. Redaction applies to failure messages, not to that log.",
+      "file": "agentic_louis/process.py"
+    },
+    {
+      "id": "failure",
+      "title": "Make failures useful to a human",
+      "start_line": 31,
+      "end_line": 35,
+      "explanation": "Every failure message names the command and working directory and adds available output. Before constructing `CommandError`, it passes this diagnostic through `redact`.\n\nFor example, a failing command that prints a known token should show `[redacted]` in this exception instead of the token.",
+      "inputs": "A failure reason and optional command output.",
+      "outputs": "A CommandError containing a filtered diagnostic.",
+      "watch_for": "The message uses stderr when available, falling back to stdout.",
+      "file": "agentic_louis/process.py"
+    },
+    {
+      "id": "redact",
+      "title": "Remove recognized secret values",
+      "start_line": 14,
+      "end_line": 18,
+      "explanation": "`redact` looks at environment variable names for markers such as `TOKEN` and `PASSWORD`, then replaces each matching value wherever it appears in the diagnostic. It also removes the user-info portion of HTTP URLs containing `@`.\n\nThis completes the error branch: the exception travels back to the caller, which decides how to report or recover from the failure.",
+      "inputs": "A diagnostic string and the merged parent/child environment.",
+      "outputs": "A diagnostic with recognized values replaced.",
+      "watch_for": "Secrets absent from the environment, or represented in a different encoding, may remain. This helper does not guarantee that arbitrary output is safe.",
+      "file": "agentic_louis/process.py"
+    }
+  ],
+  "glossary": [
+    {
+      "term": "Child process",
+      "definition": "A separate program started by the worker, such as Git or a test runner."
+    },
+    {
+      "term": "Standard streams",
+      "definition": "stdin is input; stdout carries normal output; stderr carries diagnostics."
+    },
+    {
+      "term": "Process group",
+      "definition": "A collection of processes that can receive a signal together, useful for cleaning up commands and their children."
+    }
+  ]
+}

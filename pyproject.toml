@@ -12,9 +12,10 @@ dependencies = ["python-dotenv>=1.0", "rich>=13.7", "questionary>=2.1,<3", "toml
 
 [project.scripts]
 agentic-louis = "agentic_louis.worker:main"
+code-walk = "agentic_louis.code_walk:main"
 
 [tool.setuptools]
 packages = ["agentic_louis"]
 
 [tool.setuptools.package-data]
-agentic_louis = ["result.schema.json", "projects.json"]
+agentic_louis = ["result.schema.json", "projects.json", "code_walk_web/*"]

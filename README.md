@@ -1,4 +1,150 @@
-# Jira-driven agent development
+# Agentic Louis
+
+This repository contains a Jira-driven agent worker and **Code Walk**, a local
+tool for understanding unfamiliar or agent-generated code.
+
+## Code Walk
+
+Code Walk pairs a web UI with an [explain-code skill](skills/explain-code/SKILL.md).
+An agent reads your code and writes a portable walkthrough. The UI displays the
+source beside explanations, follows execution across files, and highlights the
+lines involved in each step. You can select lines and ask follow-up questions
+through your local Codex CLI.
+
+### Try the viewer
+
+After installing `agentic-louis` with pipx, run this from the repository you want
+to explore:
+
+```sh
+agentic-louis code-walk serve --repo .
+```
+
+The UI opens automatically in your default browser at **http://127.0.0.1:7432**.
+Use `--no-open` for a remote or headless session. If no browser is available,
+the server prints the URL and keeps running. A bundled walkthrough explains this repository's
+command runner. Use **Next step**, drag across code lines to select a range
+(or click a first line and Shift-click the last),
+and use the question box at the bottom of the right pane. Stop the server with Ctrl+C. If port 7432 is
+occupied, add `--port 7433` and open that port instead.
+
+The UI uses plain JavaScript and CSS; no Node installation or frontend build is
+needed. The workspace fits the window: code and explanations scroll independently,
+while the question box stays visible. Explanation and Conversation tabs share the
+right pane; overview, glossary, and extra step details expand when needed. On narrow
+screens, navigation opens from the menu button. Code coloring is lightweight, rather than
+a full language parser.
+
+### Explain code in any repository
+
+In this checkout, ask your agent:
+
+> Use the explain-code skill to explain how the PR watcher launches an agent.
+> Produce a Code Walk walkthrough that follows the important calls and failure paths.
+
+For another checkout, point the agent at the full path to
+`skills/explain-code/SKILL.md`, or copy that skill folder into your agent's
+skill directory. For example:
+
+```sh
+mkdir -p ~/.agents/skills
+cp -R skills/explain-code ~/.agents/skills/
+```
+
+Then ask: `Use $explain-code to explain this feature as a Code Walk walkthrough.`
+The skill instructs the agent to inspect actual source and produce a plan with
+verified line references, concrete examples, and optional inputs, outputs,
+caveats, and glossary terms. After validation, the agent starts the viewer,
+which opens your default browser, and returns the running viewer URL. Ask for
+artifact-only output if you do not want the viewer launched.
+
+The bundler adds exact source snapshots and SHA-256 hashes:
+
+```sh
+agentic-louis code-walk bundle /path/to/topic.plan.json --repo /path/to/target-repository
+agentic-louis code-walk validate ~/.agentic-louis/walkthroughs/target-repository-topic.walk.json
+agentic-louis code-walk serve ~/.agentic-louis/walkthroughs/target-repository-topic.walk.json \
+  --repo /path/to/target-repository
+```
+
+Passing a walkthrough file to `serve` opens that exact explanation automatically.
+The session exposes only that file; `--repo` provides local source and question
+context. Omit the file when you want to browse the shared library instead.
+
+These commands work from any directory through the pipx-installed `agentic-louis`
+CLI; no source checkout or activated virtual environment is needed. Run
+`agentic-louis code-walk --help` to see the available commands. The complete artifact
+contract and an example plan are in [the format reference](skills/explain-code/references/format.md).
+
+Walkthroughs are stored in **`~/.agentic-louis/walkthroughs/`** by default. The
+bundler creates this directory as needed and names files
+`<repository-name>-<topic>.walk.json` using the plan filename. Use `--output` to
+choose an explicit destination. The viewer lists `*.walk.json` from that same
+shared directory. `--repo` selects the local repository used for source checks
+and agent questions. Override the library with `--walkthroughs /path/to/directory`, or click
+**Open walkthrough** to load a JSON file directly. **Export walkthrough** saves a
+portable copy. Snapshots remain readable when local files change or disappear;
+the UI marks their status. Imported files and conversation history stay in browser
+memory and are cleared on reload. A walkthrough can contain up to 100 files,
+300 steps, and 2 MB of JSON; keep large features in separate walkthroughs.
+
+### Ask questions in the UI
+
+Install Codex CLI and run `codex login` in your terminal first. The server needs
+`codex` on its PATH. Use the **Model** picker below the question box to choose
+a model for the next question. Options come from the local Codex model cache;
+**Custom model…** accepts another model ID available to your account. Leave
+**Codex default** selected to omit an explicit model override. Switching models
+keeps the conversation context. Cached options may become unavailable; refresh
+the catalog through your Codex CLI if needed.
+
+Each question includes the walkthrough, active step, any
+selected source range, and the last 20 conversation messages. Replies appear
+in the Conversation tab; they can take up to three minutes. Submitting a question
+opens that tab automatically. The agent can
+inspect the repository selected with `--repo` and is instructed to distinguish
+local changes from the included snapshots.
+
+Answers can also bring additional repository files into the viewer. **Related
+code** cards show the cited file, line range, and why it matters. Click a card
+to open and highlight those lines beside the conversation. New files appear in
+the file dropdown with an **added** label, become context for later questions,
+and are included when you export the walkthrough. The server reads their actual
+local contents; existing walkthrough snapshots are preserved. Missing or invalid
+references produce a note alongside the answer. Added files remain in browser
+memory until you export them; the original walkthrough on disk is not modified.
+
+For example, open **From a question in the UI to a Codex answer** and ask:
+“Where is the answer schema defined? Bring that file into the viewer and explain
+its fields.” The schema file is outside that walkthrough's original four files.
+Each answer can cite up to 12 ranges and attach up to 500 KB of UTF-8 source,
+with a 250 KB limit per new file and the walkthrough's overall 2 MB limit.
+
+The adapter uses `codex exec --sandbox read-only` with approvals disabled and
+`--ignore-user-config`; authentication is reused, while personal model/profile
+settings and user-configured integrations are not loaded. See the
+[official non-interactive mode documentation](https://learn.chatgpt.com/docs/non-interactive-mode).
+Chat sends its context to the model through Codex. Browsing and importing a
+walkthrough do not invoke a model. The server listens only on localhost; it is
+intended for personal local use.
+
+### Verify Code Walk
+
+For development, run these checks from a source checkout:
+
+```sh
+python3 -m unittest discover -s tests -p 'test_code_walk*.py' -v
+node --check agentic_louis/code_walk_web/app.js  # optional syntax check
+node --test tests/test_code_walk_ui.cjs          # optional UI interaction checks
+```
+
+Tests cover artifact references and hashes, exact source capture, changed/missing
+snapshots, safe path handling, local HTTP routes, request protection, and the
+Codex adapter with mocked responses and timeouts. They do not make model calls.
+The UI checks exercise opening a related file, selecting its cited range, and
+including it in export and follow-up context without starting a browser or server.
+
+## Jira-driven agent development
 
 Queue work from your local agent and run Codex on remote project workspaces. Jira connects the local and remote machines, from task intake to draft PR review.
 
